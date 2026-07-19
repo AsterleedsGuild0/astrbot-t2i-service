@@ -10,6 +10,25 @@
 
 - `PORT`: 服务端口，默认 8999
 - `IMAGE_LIFETIME_HOURS`: 图片生命时间（小时），默认 24 小时。超过此时间的图片文件将被自动清理
+- `STORAGE_BACKEND`: 图片存储后端，支持 `local`（默认）、`s3` 和 `r2`
+
+### Cloudflare R2 / S3 兼容对象存储
+
+多副本部署时，可以将 JSON 模式生成的图片写入同一个 S3 兼容存储桶，
+避免图片生成请求和后续读取请求落在不同实例时返回 `404`。API 路径和响应格式保持不变。
+
+```env
+STORAGE_BACKEND=r2
+S3_ENDPOINT_URL=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+S3_BUCKET=astrbot-t2i
+AWS_ACCESS_KEY_ID=<ACCESS_KEY_ID>
+AWS_SECRET_ACCESS_KEY=<SECRET_ACCESS_KEY>
+AWS_DEFAULT_REGION=auto
+S3_PREFIX=images
+```
+
+建议为存储桶配置对象生命周期规则以自动删除过期图片。
+`IMAGE_LIFETIME_HOURS` 只清理本地文件，不会删除对象存储中的图片。
 
 ## API 接口
 
