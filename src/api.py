@@ -184,7 +184,7 @@ async def text2img(request: GenerateRequest):
             content={
                 "code": 0,
                 "message": "success",
-                "data": {"id": image_id},
+                "data": {"id": f"data/{image_id}"},
             },
         )
     else:

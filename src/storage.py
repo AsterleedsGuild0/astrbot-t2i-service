@@ -9,6 +9,12 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+# Keep MIME resolution deterministic in minimal container images.
+mimetypes.add_type("image/png", ".png")
+mimetypes.add_type("image/jpeg", ".jpg")
+mimetypes.add_type("image/jpeg", ".jpeg")
+mimetypes.add_type("image/webp", ".webp")
+
 
 @dataclass(frozen=True)
 class StoredImage:
@@ -19,7 +25,7 @@ class StoredImage:
 
 class ImageStorage(Protocol):
     async def save(self, image_path: str) -> str:
-        """Persist an image and return its API-compatible ID."""
+        """Persist an image and return the ID accepted by get."""
         ...
 
     async def get(self, image_id: str) -> StoredImage | None:
@@ -43,7 +49,7 @@ class LocalImageStorage:
         self.data_dir = Path(data_dir)
 
     async def save(self, image_path: str) -> str:
-        return f"data/{Path(image_path).name}"
+        return Path(image_path).name
 
     async def get(self, image_id: str) -> StoredImage | None:
         filename = _safe_filename(image_id)
@@ -62,39 +68,40 @@ class S3ImageStorage:
         self,
         *,
         bucket: str,
-        endpoint_url: str,
-        access_key_id: str,
-        secret_access_key: str,
+        endpoint_url: str | None = None,
+        access_key_id: str | None = None,
+        secret_access_key: str | None = None,
         session_token: str | None = None,
-        region: str = "auto",
+        region: str | None = None,
         prefix: str = "",
         client=None,
     ):
         if not bucket:
-            raise ValueError("S3_BUCKET is required when STORAGE_BACKEND=s3")
-        if not endpoint_url:
-            raise ValueError("S3_ENDPOINT_URL is required when STORAGE_BACKEND=s3")
-        if not access_key_id:
-            raise ValueError("AWS_ACCESS_KEY_ID is required when STORAGE_BACKEND=s3")
-        if not secret_access_key:
-            raise ValueError(
-                "AWS_SECRET_ACCESS_KEY is required when STORAGE_BACKEND=s3"
-            )
+            raise ValueError("S3_BUCKET is required for S3-compatible storage")
 
         self.bucket = bucket
         self.prefix = prefix.strip("/")
-        self.client = client or boto3.client(
-            "s3",
-            endpoint_url=endpoint_url,
-            aws_access_key_id=access_key_id,
-            aws_secret_access_key=secret_access_key,
-            aws_session_token=session_token,
-            region_name=region,
-            config=Config(
-                signature_version="s3v4",
-                retries={"mode": "standard", "max_attempts": 3},
-            ),
-        )
+        if client is not None:
+            self.client = client
+        else:
+            client_kwargs = {
+                "endpoint_url": endpoint_url,
+                "aws_access_key_id": access_key_id,
+                "aws_secret_access_key": secret_access_key,
+                "aws_session_token": session_token,
+                "region_name": region,
+            }
+            client_kwargs = {
+                key: value for key, value in client_kwargs.items() if value is not None
+            }
+            self.client = boto3.client(
+                "s3",
+                config=Config(
+                    signature_version="s3v4",
+                    retries={"mode": "standard", "max_attempts": 3},
+                ),
+                **client_kwargs,
+            )
 
     def _object_key(self, filename: str) -> str:
         if self.prefix:
@@ -113,7 +120,7 @@ class S3ImageStorage:
             ExtraArgs={"ContentType": _media_type(filename)},
         )
         await asyncio.to_thread(path.unlink, missing_ok=True)
-        return f"data/{filename}"
+        return filename
 
     async def get(self, image_id: str) -> StoredImage | None:
         filename = _safe_filename(image_id)
@@ -149,13 +156,16 @@ def create_image_storage() -> ImageStorage:
     if backend == "local":
         return LocalImageStorage()
     if backend in {"s3", "r2"}:
+        endpoint_url = os.getenv("S3_ENDPOINT_URL") or None
+        if backend == "r2" and endpoint_url is None:
+            raise ValueError("S3_ENDPOINT_URL is required when STORAGE_BACKEND=r2")
         return S3ImageStorage(
             bucket=os.getenv("S3_BUCKET", ""),
-            endpoint_url=os.getenv("S3_ENDPOINT_URL", ""),
-            access_key_id=os.getenv("AWS_ACCESS_KEY_ID", ""),
-            secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", ""),
-            session_token=os.getenv("AWS_SESSION_TOKEN"),
-            region=os.getenv("AWS_DEFAULT_REGION", "auto"),
+            endpoint_url=endpoint_url,
+            access_key_id=os.getenv("AWS_ACCESS_KEY_ID") or None,
+            secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY") or None,
+            session_token=os.getenv("AWS_SESSION_TOKEN") or None,
+            region=os.getenv("AWS_DEFAULT_REGION") or None,
             prefix=os.getenv("S3_PREFIX", ""),
         )
     raise ValueError(

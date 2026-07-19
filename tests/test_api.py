@@ -24,7 +24,7 @@ class FakeStorage:
 
     async def save(self, image_path: str) -> str:
         self.saved_path = image_path
-        return "data/rendered_test.png"
+        return "rendered_test.png"
 
     async def get(self, image_id: str):
         if image_id == "rendered_test.png":
