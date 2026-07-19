@@ -5,12 +5,13 @@ from collections import deque
 
 import fastapi
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from jinja2.exceptions import SecurityError
 from loguru import logger
 from pydantic import BaseModel
 
 from .render import ScreenshotOptions, Text2ImgRender
+from .storage import create_image_storage
 from .util import cleanup_expired_files
 
 app = fastapi.FastAPI()
@@ -22,6 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 render = Text2ImgRender()
+image_storage = create_image_storage()
 rate_limit_lock = asyncio.Lock()
 rate_limit_timestamps: deque[float] = deque()
 rate_limit_max_requests = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "0"))
@@ -78,14 +80,23 @@ async def enforce_rate_limit() -> int | None:
 
 @app.get("/text2img/data/{id}")
 async def text2img_image(id: str):
-    pic = f"data/{id}"
-    if os.path.exists(pic):
-        return fastapi.responses.FileResponse(pic, media_type="image/jpeg")
-    else:
+    try:
+        image = await image_storage.get(id)
+    except Exception:
+        logger.exception("Failed to load image from storage")
+        return JSONResponse(
+            status_code=500,
+            content={"code": 1, "message": "image storage error", "data": {}},
+        )
+
+    if image is None:
         return JSONResponse(
             status_code=404,
             content={"code": 1, "message": "file not found", "data": {}},
         )
+    if image.path is not None:
+        return FileResponse(image.path, media_type=image.media_type)
+    return Response(content=image.content, media_type=image.media_type)
 
 
 @app.post("/text2img/generate")
@@ -157,15 +168,27 @@ async def text2img(request: GenerateRequest):
     media_type = "image/png" if pic.endswith(".png") else "image/jpeg"
 
     if is_json_return:
+        try:
+            image_id = await image_storage.save(pic)
+        except Exception:
+            logger.exception("Failed to persist rendered image")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "code": 1,
+                    "message": "image storage error",
+                    "data": {},
+                },
+            )
         return JSONResponse(
             content={
                 "code": 0,
                 "message": "success",
-                "data": {"id": pic.replace("\\", "/")},
+                "data": {"id": f"data/{image_id}"},
             },
         )
     else:
-        return fastapi.responses.FileResponse(pic, media_type=media_type)
+        return FileResponse(pic, media_type=media_type)
 
 
 if __name__ == "__main__":

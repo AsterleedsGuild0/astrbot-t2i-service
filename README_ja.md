@@ -10,6 +10,27 @@ HTMLやテンプレートを画像に変換するシンプルなWebサービス�
 
 - `PORT`: サービスポート、デフォルトは8999
 - `IMAGE_LIFETIME_HOURS`: 画像の保持時間（時間単位）、デフォルトは24時間。この時間を超えた画像ファイルは自動的にクリーンアップされます
+- `STORAGE_BACKEND`: 画像ストレージバックエンド。`local`（デフォルト）、`s3`、`r2`をサポートします
+
+### Cloudflare R2 / S3互換オブジェクトストレージ
+
+複数のレプリカを実行する場合、JSONモードで生成された画像を共通の
+S3互換バケットに保存できます。これにより、画像の取得リクエストが
+生成元とは異なるレプリカに到達しても`404`になることを防ぎます。
+APIのパスとレスポンス形式は変更されません。
+
+```env
+STORAGE_BACKEND=r2
+S3_ENDPOINT_URL=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+S3_BUCKET=astrbot-t2i
+AWS_ACCESS_KEY_ID=<ACCESS_KEY_ID>
+AWS_SECRET_ACCESS_KEY=<SECRET_ACCESS_KEY>
+AWS_DEFAULT_REGION=auto
+S3_PREFIX=images
+```
+
+古い画像を自動削除するには、バケットにオブジェクトライフサイクルルールを設定してください。
+`IMAGE_LIFETIME_HOURS`はローカルファイルのみを削除し、オブジェクトストレージには適用されません。
 
 ## API エンドポイント
 

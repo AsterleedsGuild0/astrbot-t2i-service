@@ -10,6 +10,27 @@ A simple web service that converts HTML/templates to images, with image lifecycl
 
 - `PORT`: Service port, default is 8999
 - `IMAGE_LIFETIME_HOURS`: Image lifetime in hours, default is 24 hours. Images older than this will be automatically cleaned up
+- `STORAGE_BACKEND`: Image storage backend. Supports `local` (default), `s3`, and `r2`
+
+### Cloudflare R2 / S3-compatible object storage
+
+When running multiple replicas, JSON-mode images can be stored in one shared
+S3-compatible bucket. This prevents a later image request from returning `404`
+when it reaches a replica other than the one that rendered the image. API paths
+and response formats remain unchanged.
+
+```env
+STORAGE_BACKEND=r2
+S3_ENDPOINT_URL=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+S3_BUCKET=astrbot-t2i
+AWS_ACCESS_KEY_ID=<ACCESS_KEY_ID>
+AWS_SECRET_ACCESS_KEY=<SECRET_ACCESS_KEY>
+AWS_DEFAULT_REGION=auto
+S3_PREFIX=images
+```
+
+Configure an object lifecycle rule on the bucket to expire old images.
+`IMAGE_LIFETIME_HOURS` only cleans up local files and does not delete objects.
 
 ## API Endpoints
 
