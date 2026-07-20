@@ -109,7 +109,7 @@ async def periodic_cleanup():
     while True:
         started = time.perf_counter()
         try:
-            cleaned = cleanup_expired_files()
+            cleaned = await asyncio.to_thread(cleanup_expired_files)
             CLEANUP_FILES.inc(cleaned)
             CLEANUP_RUNS.labels(result="success").inc()
         except Exception:

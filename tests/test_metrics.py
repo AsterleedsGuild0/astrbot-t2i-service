@@ -1,5 +1,6 @@
 import asyncio
 
+import pytest
 from fastapi import Request
 from prometheus_client import generate_latest
 
@@ -64,6 +65,26 @@ def test_metrics_generation_runs_in_a_worker_thread(monkeypatch):
 
     assert calls == [api.generate_latest]
     assert response.body == b"test_metric 1\n"
+
+
+def test_periodic_cleanup_runs_in_a_worker_thread(monkeypatch):
+    calls = []
+
+    async def fake_to_thread(function):
+        calls.append(function)
+        return 2
+
+    async def stop_after_first_interval(delay):
+        assert delay == 3600
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(api.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(api.asyncio, "sleep", stop_after_first_interval)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(api.periodic_cleanup())
+
+    assert calls == [api.cleanup_expired_files]
 
 
 def test_metrics_endpoint_is_disabled_by_default(monkeypatch):
