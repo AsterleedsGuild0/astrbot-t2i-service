@@ -153,8 +153,9 @@ async def prometheus_metrics(request: fastapi.Request):
             status_code=401,
             headers={"WWW-Authenticate": "Bearer"},
         )
+    content = await asyncio.to_thread(generate_latest)
     return Response(
-        content=generate_latest(),
+        content=content,
         headers={"Content-Type": CONTENT_TYPE_LATEST},
     )
 

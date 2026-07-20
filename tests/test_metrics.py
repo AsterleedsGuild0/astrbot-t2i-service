@@ -50,6 +50,22 @@ def test_metrics_endpoint_supports_bearer_auth(monkeypatch):
     assert authorized.status_code == 200
 
 
+def test_metrics_generation_runs_in_a_worker_thread(monkeypatch):
+    monkeypatch.setattr(api, "METRICS_ENABLED", True)
+    calls = []
+
+    async def fake_to_thread(function):
+        calls.append(function)
+        return b"test_metric 1\n"
+
+    monkeypatch.setattr(api.asyncio, "to_thread", fake_to_thread)
+
+    response = asyncio.run(api.prometheus_metrics(make_request()))
+
+    assert calls == [api.generate_latest]
+    assert response.body == b"test_metric 1\n"
+
+
 def test_metrics_endpoint_is_disabled_by_default(monkeypatch):
     monkeypatch.setattr(api, "METRICS_ENABLED", False)
 
