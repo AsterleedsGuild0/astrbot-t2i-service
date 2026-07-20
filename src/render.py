@@ -1,14 +1,28 @@
+import os
 import re
+import time
 
-from .util import generate_data_path
-from playwright.async_api import async_playwright
 from jinja2.sandbox import SandboxedEnvironment
-from pydantic import BaseModel
-from typing_extensions import TypedDict
-from typing import Literal
 from loguru import logger
-from playwright.async_api import BrowserContext, Browser, Playwright
 from playwright._impl._errors import TargetClosedError
+from playwright.async_api import Browser, BrowserContext, Playwright, async_playwright
+from pydantic import BaseModel
+from typing import Literal
+from typing_extensions import TypedDict
+
+from .metrics import (
+    BROWSER_CONNECTED,
+    BROWSER_CONTEXTS,
+    BROWSER_RESTARTS,
+    BROWSER_STARTS,
+    RENDER_ACTIVE_PAGES,
+    RENDER_DURATION,
+    RENDER_IN_PROGRESS,
+    RENDER_OUTPUT_BYTES,
+    RENDER_REQUESTS,
+    RENDER_VIEWPORT_PIXELS,
+)
+from .util import generate_data_path
 
 
 class FloatRect(TypedDict):
@@ -104,6 +118,8 @@ class Text2ImgRender:
                 except Exception as e:
                     logger.debug(f"Close old browser failed: {e}")
             self.browser = await self.playwright.chromium.launch(headless=True)
+            BROWSER_STARTS.inc()
+            BROWSER_CONNECTED.set(1)
 
         # ensure context available for the specified level
         if level not in self.contexts:
@@ -114,6 +130,7 @@ class Text2ImgRender:
             logger.info(
                 f"Created context for level '{level}' with device_scale_factor={scale_factor}"
             )
+            BROWSER_CONTEXTS.set(len(self.contexts))
 
         return self.contexts[level]
 
@@ -131,7 +148,7 @@ class Text2ImgRender:
         return html_file_path, abs_path
 
     def _resolve_viewport_size(
-            self, html_file_path: str, screenshot_options: ScreenshotOptions
+        self, html_file_path: str, screenshot_options: ScreenshotOptions
     ) -> tuple[int | None, int | None]:
         """根据截图参数与 HTML 内容推断 viewport 大小（宽, 高）。
 
@@ -188,6 +205,7 @@ class Text2ImgRender:
             except Exception as e:
                 logger.debug(f"Close context for level '{level}' failed: {e}")
         self.contexts.clear()
+        BROWSER_CONTEXTS.set(0)
 
         if self.browser is not None:
             try:
@@ -195,6 +213,7 @@ class Text2ImgRender:
             except Exception as e:
                 logger.debug(f"Close browser failed: {e}")
             self.browser = None
+        BROWSER_CONNECTED.set(0)
 
         if self.playwright is not None:
             try:
@@ -204,59 +223,92 @@ class Text2ImgRender:
             self.playwright = None
 
     async def html2pic(
-            self, html_file_path: str, screenshot_options: ScreenshotOptions
+        self, html_file_path: str, screenshot_options: ScreenshotOptions
     ) -> str:
         # Determine which context to use based on device_scale_factor_level
         level = screenshot_options.device_scale_factor_level or "normal"
-        context = await self._ensure_context(level)
-
         suffix = screenshot_options.type if screenshot_options.type else "png"
-        result_path, _ = generate_data_path(suffix=suffix, namespace="rendered")
-
+        started = time.perf_counter()
+        result = "error"
+        page = None
+        RENDER_IN_PROGRESS.inc()
         try:
-            page = await context.new_page()
-        except TargetClosedError as e:
-            logger.warning(
-                f"html2pic: Failed to create new page, restarting browser context: {e}"
-            )
-            # Close and remove the specific context, then recreate it
-            if level in self.contexts:
-                try:
-                    await self.contexts[level].close()
-                except Exception:
-                    pass
-                del self.contexts[level]
             context = await self._ensure_context(level)
-            page = await context.new_page()
+            result_path, _ = generate_data_path(suffix=suffix, namespace="rendered")
 
-        viewport_width, viewport_height = self._resolve_viewport_size(
-            html_file_path, screenshot_options
-        )
+            try:
+                page = await context.new_page()
+            except TargetClosedError as e:
+                BROWSER_RESTARTS.labels(reason="target_closed").inc()
+                logger.warning(
+                    f"html2pic: Failed to create new page, restarting browser context: {e}"
+                )
+                # Close and remove the specific context, then recreate it
+                if level in self.contexts:
+                    try:
+                        await self.contexts[level].close()
+                    except Exception:
+                        pass
+                    del self.contexts[level]
+                    BROWSER_CONTEXTS.set(len(self.contexts))
+                context = await self._ensure_context(level)
+                page = await context.new_page()
+            RENDER_ACTIVE_PAGES.inc()
 
-        width = viewport_width if viewport_width is not None else 800
-        height = viewport_height if viewport_height is not None else 720
-        # Always set viewport size to ensure defaults are applied
-        await page.set_viewport_size({"width": width, "height": height})
-        logger.info(f"html2pic: set viewport size to {width}x{height}")
-
-        try:
-            await page.goto(
-                f"file://{html_file_path}", timeout=screenshot_options.timeout
+            viewport_width, viewport_height = self._resolve_viewport_size(
+                html_file_path, screenshot_options
             )
-            screenshot_kwargs = screenshot_options.model_dump(exclude_none=True)
-            screenshot_kwargs.pop("viewport_width", None)
-            screenshot_kwargs.pop("viewport_height", None)
-            screenshot_kwargs.pop("device_scale_factor_level", None)
 
-            # Robustness: Remove quality if type is png, as Playwright errors out
-            if screenshot_options.type == "png":
-                screenshot_kwargs.pop("quality", None)
+            width = viewport_width if viewport_width is not None else 800
+            height = viewport_height if viewport_height is not None else 720
+            scale_factor = self.SCALE_FACTOR_MAP.get(level, 1.0)
+            RENDER_VIEWPORT_PIXELS.labels(scale=level).observe(
+                width * height * scale_factor * scale_factor
+            )
+            # Always set viewport size to ensure defaults are applied
+            await page.set_viewport_size({"width": width, "height": height})
+            logger.info(f"html2pic: set viewport size to {width}x{height}")
 
-            await page.screenshot(path=result_path, **screenshot_kwargs)
+            try:
+                await page.goto(
+                    f"file://{html_file_path}", timeout=screenshot_options.timeout
+                )
+                screenshot_kwargs = screenshot_options.model_dump(exclude_none=True)
+                screenshot_kwargs.pop("viewport_width", None)
+                screenshot_kwargs.pop("viewport_height", None)
+                screenshot_kwargs.pop("device_scale_factor_level", None)
+
+                # Robustness: Remove quality if type is png, as Playwright errors out
+                if screenshot_options.type == "png":
+                    screenshot_kwargs.pop("quality", None)
+
+                await page.screenshot(path=result_path, **screenshot_kwargs)
+            finally:
+                # Ensure the page is closed to free resources
+                await page.close()
+                page = None
+                RENDER_ACTIVE_PAGES.dec()
+
+            RENDER_OUTPUT_BYTES.labels(format=suffix).observe(
+                os.path.getsize(result_path)
+            )
+            result = "success"
+            logger.info(f"Rendered {html_file_path} to {result_path}")
+            return result_path
         finally:
-            # Ensure the page is closed to free resources
-            await page.close()
-
-        logger.info(f"Rendered {html_file_path} to {result_path}")
-
-        return result_path
+            if page is not None:
+                try:
+                    await page.close()
+                finally:
+                    RENDER_ACTIVE_PAGES.dec()
+            if self.browser is None or not self.browser.is_connected():
+                BROWSER_CONNECTED.set(0)
+            RENDER_REQUESTS.labels(
+                result=result,
+                format=suffix,
+                scale=level,
+            ).inc()
+            RENDER_DURATION.labels(result=result, scale=level).observe(
+                time.perf_counter() - started
+            )
+            RENDER_IN_PROGRESS.dec()
