@@ -8,49 +8,93 @@ from prometheus_client import Counter, Gauge, Histogram, REGISTRY
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
 
 
-HTTP_REQUESTS = Counter(
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+METRICS_ENABLED = _env_flag("METRICS_ENABLED")
+
+
+class _DisabledMetric:
+    """Prometheus metric compatible no-op used when metrics are disabled."""
+
+    def labels(self, *args, **kwargs):
+        return self
+
+    def inc(self, *args, **kwargs):
+        return None
+
+    def dec(self, *args, **kwargs):
+        return None
+
+    def set(self, *args, **kwargs):
+        return None
+
+    def observe(self, *args, **kwargs):
+        return None
+
+
+def _metric(metric_type, *args, **kwargs):
+    if not METRICS_ENABLED:
+        return _DisabledMetric()
+    return metric_type(*args, **kwargs)
+
+
+HTTP_REQUESTS = _metric(
+    Counter,
     "t2i_http_requests_total",
     "HTTP requests handled by the t2i service.",
     ("method", "route", "status_code"),
 )
-HTTP_REQUEST_DURATION = Histogram(
+HTTP_REQUEST_DURATION = _metric(
+    Histogram,
     "t2i_http_request_duration_seconds",
     "HTTP request duration in seconds.",
     ("method", "route"),
     buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
 )
-HTTP_REQUESTS_IN_PROGRESS = Gauge(
+HTTP_REQUESTS_IN_PROGRESS = _metric(
+    Gauge,
     "t2i_http_requests_in_progress",
     "HTTP requests currently being handled.",
     ("method",),
 )
 
-RENDER_REQUESTS = Counter(
+RENDER_REQUESTS = _metric(
+    Counter,
     "t2i_render_requests_total",
     "Completed screenshot renders.",
     ("result", "format", "scale"),
 )
-RENDER_DURATION = Histogram(
+RENDER_DURATION = _metric(
+    Histogram,
     "t2i_render_duration_seconds",
     "Screenshot render duration in seconds.",
     ("result", "scale"),
     buckets=(0.1, 0.25, 0.5, 1, 2, 3, 5, 8, 13, 21, 34, 55, 90),
 )
-RENDER_IN_PROGRESS = Gauge(
+RENDER_IN_PROGRESS = _metric(
+    Gauge,
     "t2i_render_in_progress",
     "Screenshot renders currently in progress.",
 )
-RENDER_ACTIVE_PAGES = Gauge(
+RENDER_ACTIVE_PAGES = _metric(
+    Gauge,
     "t2i_render_active_pages",
     "Chromium pages currently open for screenshot rendering.",
 )
-RENDER_INPUT_BYTES = Histogram(
+RENDER_INPUT_BYTES = _metric(
+    Histogram,
     "t2i_render_input_bytes",
     "Size of HTML or template input in bytes.",
     ("source",),
     buckets=(1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304),
 )
-RENDER_OUTPUT_BYTES = Histogram(
+RENDER_OUTPUT_BYTES = _metric(
+    Histogram,
     "t2i_render_output_bytes",
     "Size of generated images in bytes.",
     ("format",),
@@ -64,7 +108,8 @@ RENDER_OUTPUT_BYTES = Histogram(
         67_108_864,
     ),
 )
-RENDER_VIEWPORT_PIXELS = Histogram(
+RENDER_VIEWPORT_PIXELS = _metric(
+    Histogram,
     "t2i_render_viewport_pixels",
     "Effective viewport pixels after applying the device scale factor.",
     ("scale",),
@@ -80,48 +125,58 @@ RENDER_VIEWPORT_PIXELS = Histogram(
     ),
 )
 
-BROWSER_CONNECTED = Gauge(
+BROWSER_CONNECTED = _metric(
+    Gauge,
     "t2i_browser_connected",
     "Whether the managed Chromium browser is connected (1 or 0).",
 )
-BROWSER_CONTEXTS = Gauge(
+BROWSER_CONTEXTS = _metric(
+    Gauge,
     "t2i_browser_contexts",
     "Number of managed Chromium browser contexts.",
 )
-BROWSER_STARTS = Counter(
+BROWSER_STARTS = _metric(
+    Counter,
     "t2i_browser_starts_total",
     "Chromium browser process starts.",
 )
-BROWSER_RESTARTS = Counter(
+BROWSER_RESTARTS = _metric(
+    Counter,
     "t2i_browser_restarts_total",
     "Chromium browser restarts after a rendering failure.",
     ("reason",),
 )
-RATE_LIMIT_REJECTIONS = Counter(
+RATE_LIMIT_REJECTIONS = _metric(
+    Counter,
     "t2i_rate_limit_rejections_total",
     "Requests rejected by the in-process rate limiter.",
 )
-IMAGE_STORAGE_OPERATIONS = Counter(
+IMAGE_STORAGE_OPERATIONS = _metric(
+    Counter,
     "t2i_image_storage_operations_total",
     "Image storage operations.",
     ("operation", "result"),
 )
-IMAGE_STORAGE_DURATION = Histogram(
+IMAGE_STORAGE_DURATION = _metric(
+    Histogram,
     "t2i_image_storage_duration_seconds",
     "Image storage operation duration in seconds.",
     ("operation",),
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
 )
-CLEANUP_RUNS = Counter(
+CLEANUP_RUNS = _metric(
+    Counter,
     "t2i_cleanup_runs_total",
     "Periodic cleanup runs.",
     ("result",),
 )
-CLEANUP_FILES = Counter(
+CLEANUP_FILES = _metric(
+    Counter,
     "t2i_cleanup_files_total",
     "Expired local files removed by periodic cleanup.",
 )
-CLEANUP_DURATION = Histogram(
+CLEANUP_DURATION = _metric(
+    Histogram,
     "t2i_cleanup_duration_seconds",
     "Periodic cleanup duration in seconds.",
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
@@ -310,4 +365,5 @@ class RuntimeCollector:
 
 
 RUNTIME_COLLECTOR = RuntimeCollector()
-REGISTRY.register(RUNTIME_COLLECTOR)
+if METRICS_ENABLED:
+    REGISTRY.register(RUNTIME_COLLECTOR)

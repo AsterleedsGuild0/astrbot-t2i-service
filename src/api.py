@@ -21,6 +21,7 @@ from .metrics import (
     HTTP_REQUESTS_IN_PROGRESS,
     IMAGE_STORAGE_DURATION,
     IMAGE_STORAGE_OPERATIONS,
+    METRICS_ENABLED,
     RATE_LIMIT_REJECTIONS,
     RENDER_INPUT_BYTES,
 )
@@ -60,6 +61,9 @@ def metric_route(path: str) -> str:
 
 @app.middleware("http")
 async def observe_http_requests(request: fastapi.Request, call_next):
+    if not METRICS_ENABLED:
+        return await call_next(request)
+
     method = request.method.upper()
     route_path = metric_route(request.url.path)
     started = time.perf_counter()
@@ -136,6 +140,9 @@ async def enforce_rate_limit() -> int | None:
 
 @app.get("/metrics", include_in_schema=False)
 async def prometheus_metrics(request: fastapi.Request):
+    if not METRICS_ENABLED:
+        return Response(status_code=404)
+
     metrics_token = os.getenv("METRICS_TOKEN", "")
     authorization = request.headers.get("Authorization", "")
     if metrics_token and not secrets.compare_digest(

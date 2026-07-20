@@ -29,6 +29,7 @@ def make_request(authorization: str = "") -> Request:
 
 
 def test_metrics_endpoint_exposes_prometheus_payload(monkeypatch):
+    monkeypatch.setattr(api, "METRICS_ENABLED", True)
     monkeypatch.delenv("METRICS_TOKEN", raising=False)
     response = asyncio.run(api.prometheus_metrics(make_request()))
 
@@ -39,6 +40,7 @@ def test_metrics_endpoint_exposes_prometheus_payload(monkeypatch):
 
 
 def test_metrics_endpoint_supports_bearer_auth(monkeypatch):
+    monkeypatch.setattr(api, "METRICS_ENABLED", True)
     monkeypatch.setenv("METRICS_TOKEN", "test-token")
 
     unauthorized = asyncio.run(api.prometheus_metrics(make_request()))
@@ -46,6 +48,15 @@ def test_metrics_endpoint_supports_bearer_auth(monkeypatch):
 
     assert unauthorized.status_code == 401
     assert authorized.status_code == 200
+
+
+def test_metrics_endpoint_is_disabled_by_default(monkeypatch):
+    monkeypatch.setattr(api, "METRICS_ENABLED", False)
+
+    response = asyncio.run(api.prometheus_metrics(make_request()))
+
+    assert response.status_code == 404
+    assert response.body == b""
 
 
 def test_runtime_collector_reads_cgroup_v2_metrics(tmp_path):

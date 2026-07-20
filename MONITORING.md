@@ -1,13 +1,22 @@
 # t2i monitoring
 
-The service exposes Prometheus-compatible metrics at `GET /metrics`. Set
-`METRICS_TOKEN` in production and send the same value as a bearer token when
-scraping:
+Metrics are disabled by default. Enable the Prometheus-compatible `GET /metrics`
+endpoint and set a strong bearer token in production:
+
+```env
+METRICS_ENABLED=true
+METRICS_TOKEN=<strong-random-token>
+```
+
+Send the same token when scraping:
 
 ```yaml
 authorization:
   credentials_file: /path/to/token
 ```
+
+When `METRICS_ENABLED` is unset or false, instrumentation uses no-op collectors
+and `GET /metrics` returns `404`.
 
 The metrics intentionally use bounded labels. Image IDs, template names, HTML,
 URLs, process IDs, and exception messages are never used as labels.
