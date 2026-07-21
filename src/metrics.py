@@ -216,7 +216,13 @@ def _read_key_values(path: Path) -> dict[str, float]:
 def _process_table() -> dict[int, tuple[int, str, int]]:
     """Return pid -> (ppid, searchable name/cmdline, resident bytes)."""
     table: dict[int, tuple[int, str, int]] = {}
-    page_size = os.sysconf("SC_PAGE_SIZE")
+    if not hasattr(os, "sysconf"):
+        return table
+
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return table
 
     try:
         entries = list(Path("/proc").iterdir())

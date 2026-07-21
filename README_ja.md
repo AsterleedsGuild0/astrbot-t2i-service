@@ -11,6 +11,9 @@ HTMLやテンプレートを画像に変換するシンプルなWebサービス�
 - `PORT`: サービスポート、デフォルトは8999
 - `IMAGE_LIFETIME_HOURS`: 画像の保持時間（時間単位）、デフォルトは24時間。この時間を超えた画像ファイルは自動的にクリーンアップされます
 - `STORAGE_BACKEND`: 画像ストレージバックエンド。`local`（デフォルト）、`s3`、`r2`をサポートします
+- `T2I_RENDER_WAIT_UNTIL`: Playwright のページ遷移待機戦略。デフォルトは `domcontentloaded`
+- `T2I_SKIP_FONT_READY`: スクリーンショット前の Playwright 内部 `document.fonts.ready` 待機をスキップするかどうか。デフォルトは `true`
+- `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS`: プロセス内レート制限設定。両方とも 0 より大きい場合に有効
 
 ### Cloudflare R2 / S3互換オブジェクトストレージ
 
@@ -46,6 +49,7 @@ HTMLを画像に変換
 - `bool` json: JSON形式で返すかどうか（idを返します）
 - `dict` `optional` options
   - timeout (float, optional): スクリーンショットのタイムアウト時間。
+  - wait_until (Literal["commit", "domcontentloaded", "load", "networkidle"], optional): ページ遷移の待機状態。デフォルトはサービス側の `T2I_RENDER_WAIT_UNTIL` を使用します。
   - type (Literal["jpeg", "png"], optional): スクリーンショットの画像タイプ。
   - quality (int, optional): スクリーンショットの品質、JPEG形式のみ適用されます。
   - omit_background (bool, optional): デフォルトの白い背景を非表示にするかどうか。これにより透明なスクリーンショットが可能になります（PNG形式のみ）。
@@ -70,3 +74,7 @@ HTMLを画像に変換
 ### GET /text2img/data/{id}
 
 idに対応する画像を返します。
+
+## Docker レンダリング補足
+
+コンテナイメージには `fonts-noto-cjk` と `fonts-noto-color-emoji` を追加し、中国語と emoji の描画安定性を高めています。

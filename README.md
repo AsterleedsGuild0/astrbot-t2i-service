@@ -11,6 +11,9 @@ A simple web service that converts HTML/templates to images, with image lifecycl
 - `PORT`: Service port, default is 8999
 - `IMAGE_LIFETIME_HOURS`: Image lifetime in hours, default is 24 hours. Images older than this will be automatically cleaned up
 - `STORAGE_BACKEND`: Image storage backend. Supports `local` (default), `s3`, and `r2`
+- `T2I_RENDER_WAIT_UNTIL`: Playwright page navigation wait strategy. Defaults to `domcontentloaded`
+- `T2I_SKIP_FONT_READY`: Whether to skip Playwright's internal `document.fonts.ready` wait before screenshotting. Defaults to `true`
+- `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS`: In-process rate limit settings. Both must be greater than 0 to enable
 
 ### Cloudflare R2 / S3-compatible object storage
 
@@ -46,6 +49,7 @@ Convert HTML to image
 - `bool` json: Whether to return JSON format (returns an id)
 - `dict` `optional` options
   - timeout (float, optional): Screenshot timeout.
+  - wait_until (Literal["commit", "domcontentloaded", "load", "networkidle"], optional): Page navigation wait state. Defaults to the service-level `T2I_RENDER_WAIT_UNTIL`.
   - type (Literal["jpeg", "png"], optional): Screenshot image type.
   - quality (int, optional): Screenshot quality, only applicable to JPEG format.
   - omit_background (bool, optional): Whether to hide the default white background, allowing transparent screenshots (PNG only).
@@ -70,3 +74,7 @@ Convert HTML to image
 ### GET /text2img/data/{id}
 
 Returns the corresponding image by id.
+
+## Docker rendering notes
+
+The container image installs `fonts-noto-cjk` and `fonts-noto-color-emoji` to improve Chinese and emoji rendering consistency.

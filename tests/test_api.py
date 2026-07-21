@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from src import api
+from src.render import RenderError
 from src.storage import StoredImage
 
 
@@ -30,6 +31,11 @@ class FakeStorage:
         if image_id == "rendered_test.png":
             return StoredImage(content=b"png", media_type="image/png")
         return None
+
+
+class FailingRenderer(FakeRenderer):
+    async def html2pic(self, html_file_path, screenshot_options):
+        raise RenderError("goto", "page.goto failed: Timeout")
 
 
 def test_generate_json_response_remains_compatible(tmp_path, monkeypatch):
@@ -76,4 +82,35 @@ def test_get_missing_image_response_remains_compatible(monkeypatch):
         "code": 1,
         "message": "file not found",
         "data": {},
+    }
+
+
+def test_generate_render_error_returns_structured_payload(tmp_path, monkeypatch):
+    output_path = tmp_path / "rendered_test.png"
+    monkeypatch.setattr(api, "render", FailingRenderer(output_path))
+
+    response = asyncio.run(
+        api.text2img(
+            api.GenerateRequest(
+                html="<html><body>test</body></html>",
+                json=True,
+            )
+        )
+    )
+
+    assert response.status_code == 500
+    assert json.loads(response.body) == {
+        "code": 1,
+        "message": "render error: page.goto failed: Timeout",
+        "data": {
+            "error_type": "RenderError",
+            "html_file": "rendered_test.html",
+            "options": {
+                "wait_until": "domcontentloaded",
+                "type": "png",
+                "full_page": True,
+                "scale": "device",
+            },
+            "stage": "goto",
+        },
     }

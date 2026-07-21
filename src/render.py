@@ -7,7 +7,7 @@ from loguru import logger
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Browser, BrowserContext, Playwright, async_playwright
 from pydantic import BaseModel
-from typing import Literal
+from typing import Literal, cast
 from typing_extensions import TypedDict
 
 from .metrics import (
@@ -23,6 +23,51 @@ from .metrics import (
     RENDER_VIEWPORT_PIXELS,
 )
 from .util import generate_data_path
+
+WaitUntil = Literal["commit", "domcontentloaded", "load", "networkidle"]
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"", "0", "false", "no", "off"}:
+        return False
+
+    logger.warning(f"Invalid {name} value {value!r}; falling back to {default}")
+    return default
+
+
+def _env_wait_until() -> WaitUntil:
+    value = os.getenv("T2I_RENDER_WAIT_UNTIL", "domcontentloaded").strip().lower()
+    valid_wait_until = {"commit", "domcontentloaded", "load", "networkidle"}
+    if value in valid_wait_until:
+        return cast(WaitUntil, value)
+
+    logger.warning(
+        "Invalid T2I_RENDER_WAIT_UNTIL value "
+        f"{value!r}; falling back to domcontentloaded"
+    )
+    return "domcontentloaded"
+
+
+DEFAULT_RENDER_WAIT_UNTIL = _env_wait_until()
+SKIP_FONT_READY = _env_flag("T2I_SKIP_FONT_READY", True)
+
+# Playwright 默认会在截图前等待 document.fonts.ready。服务端场景中若远程字体
+# 加载缓慢或不可达，可能导致截图阶段超时。该开关允许在需要时跳过这一步等待。
+if SKIP_FONT_READY:
+    os.environ.setdefault("PW_TEST_SCREENSHOT_NO_FONTS_READY", "1")
+
+
+class RenderError(RuntimeError):
+    def __init__(self, stage: str, message: str):
+        super().__init__(message)
+        self.stage = stage
 
 
 class FloatRect(TypedDict):
@@ -70,6 +115,7 @@ class ScreenshotOptions(BaseModel):
     """
 
     timeout: float | None = None
+    wait_until: WaitUntil | None = DEFAULT_RENDER_WAIT_UNTIL
     type: Literal["jpeg", "png", None] = None
     quality: int | None = None
     omit_background: bool | None = None
@@ -96,6 +142,14 @@ class Text2ImgRender:
         self.browser: Browser | None = None
         # Context pool: {"normal": context, "high": context, "ultra": context}
         self.contexts: dict[str, BrowserContext] = {}
+        logger.info(
+            "Text2ImgRender config: "
+            f"default_wait_until={DEFAULT_RENDER_WAIT_UNTIL}, "
+            f"skip_font_ready={SKIP_FONT_READY}"
+        )
+
+    def _resolve_wait_until(self, wait_until: WaitUntil | None) -> WaitUntil:
+        return wait_until or DEFAULT_RENDER_WAIT_UNTIL
 
     async def _ensure_context(self, level: str = "normal") -> BrowserContext:
         """Ensure that Playwright, Browser and BrowserContext are initialized.
@@ -255,6 +309,83 @@ class Text2ImgRender:
                 page = await context.new_page()
             RENDER_ACTIVE_PAGES.inc()
 
+            wait_until = self._resolve_wait_until(screenshot_options.wait_until)
+
+            def _truncate(value: str | None, limit: int = 300) -> str:
+                if value is None:
+                    return ""
+                return value if len(value) <= limit else f"{value[:limit]}..."
+
+            def _sanitize_url(url: str | None) -> str:
+                if not url:
+                    return ""
+                safe_url = url.split("?", 1)[0].split("#", 1)[0]
+                return _truncate(safe_url)
+
+            def _request_failure_reason(request) -> str:
+                failure = getattr(request, "failure", None)
+                if callable(failure):
+                    failure = failure()
+                if failure is None:
+                    return "no_detail"
+                return _truncate(str(failure))
+
+            def _log_render_event(event: str, level_name: str = "warning", **details) -> None:
+                log_func = getattr(logger, level_name, logger.warning)
+                log_func(
+                    "html2pic page event: "
+                    f"event={event}, html_file_path={html_file_path}, "
+                    f"timeout={screenshot_options.timeout}, wait_until={wait_until}, "
+                    f"full_page={screenshot_options.full_page}, type={screenshot_options.type}, "
+                    f"device_scale_factor_level={level}, details={details}"
+                )
+
+            page.on(
+                "requestfailed",
+                lambda request: _log_render_event(
+                    "requestfailed",
+                    url=_sanitize_url(getattr(request, "url", None)),
+                    failure=_request_failure_reason(request),
+                ),
+            )
+            page.on(
+                "response",
+                lambda response: (
+                    _log_render_event(
+                        "response_error",
+                        level_name="info",
+                        status=getattr(response, "status", None),
+                        url=_sanitize_url(getattr(response, "url", None)),
+                    )
+                    if getattr(response, "status", 0) >= 400
+                    else None
+                ),
+            )
+            page.on(
+                "pageerror",
+                lambda error: _log_render_event(
+                    "pageerror",
+                    message=_truncate(str(error)),
+                ),
+            )
+            page.on(
+                "console",
+                lambda message: (
+                    _log_render_event(
+                        "console",
+                        level_name=(
+                            "warning"
+                            if getattr(message, "type", None) == "error"
+                            else "info"
+                        ),
+                        type=getattr(message, "type", None),
+                        message=_truncate(getattr(message, "text", None)),
+                    )
+                    if getattr(message, "type", None) in {"warning", "error"}
+                    else None
+                ),
+            )
+
             viewport_width, viewport_height = self._resolve_viewport_size(
                 html_file_path, screenshot_options
             )
@@ -270,10 +401,29 @@ class Text2ImgRender:
             logger.info(f"html2pic: set viewport size to {width}x{height}")
 
             try:
-                await page.goto(
-                    f"file://{html_file_path}", timeout=screenshot_options.timeout
+                logger.info(
+                    "html2pic goto start: "
+                    f"html_file_path={html_file_path}, timeout={screenshot_options.timeout}, "
+                    f"wait_until={wait_until}, full_page={screenshot_options.full_page}, "
+                    f"type={screenshot_options.type}, device_scale_factor_level={level}"
                 )
+                try:
+                    await page.goto(
+                        f"file://{html_file_path}",
+                        timeout=screenshot_options.timeout,
+                        wait_until=wait_until,
+                    )
+                except Exception as e:
+                    logger.exception(
+                        "html2pic goto failed: "
+                        f"html_file_path={html_file_path}, timeout={screenshot_options.timeout}, "
+                        f"wait_until={wait_until}, full_page={screenshot_options.full_page}, "
+                        f"type={screenshot_options.type}, device_scale_factor_level={level}"
+                    )
+                    raise RenderError("goto", f"page.goto failed: {e}") from e
+
                 screenshot_kwargs = screenshot_options.model_dump(exclude_none=True)
+                screenshot_kwargs.pop("wait_until", None)
                 screenshot_kwargs.pop("viewport_width", None)
                 screenshot_kwargs.pop("viewport_height", None)
                 screenshot_kwargs.pop("device_scale_factor_level", None)
@@ -282,10 +432,28 @@ class Text2ImgRender:
                 if screenshot_options.type == "png":
                     screenshot_kwargs.pop("quality", None)
 
-                await page.screenshot(path=result_path, **screenshot_kwargs)
+                logger.info(
+                    "html2pic screenshot start: "
+                    f"html_file_path={html_file_path}, timeout={screenshot_options.timeout}, "
+                    f"wait_until={wait_until}, full_page={screenshot_options.full_page}, "
+                    f"type={screenshot_options.type}, device_scale_factor_level={level}"
+                )
+                try:
+                    await page.screenshot(path=result_path, **screenshot_kwargs)
+                except Exception as e:
+                    logger.exception(
+                        "html2pic screenshot failed: "
+                        f"html_file_path={html_file_path}, timeout={screenshot_options.timeout}, "
+                        f"wait_until={wait_until}, full_page={screenshot_options.full_page}, "
+                        f"type={screenshot_options.type}, device_scale_factor_level={level}"
+                    )
+                    raise RenderError("screenshot", f"page.screenshot failed: {e}") from e
             finally:
                 # Ensure the page is closed to free resources
-                await page.close()
+                try:
+                    await page.close()
+                except Exception as e:
+                    logger.debug(f"html2pic: close page failed: {e}")
                 page = None
                 RENDER_ACTIVE_PAGES.dec()
 

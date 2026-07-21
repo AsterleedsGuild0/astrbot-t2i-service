@@ -25,7 +25,7 @@ from .metrics import (
     RATE_LIMIT_REJECTIONS,
     RENDER_INPUT_BYTES,
 )
-from .render import ScreenshotOptions, Text2ImgRender
+from .render import RenderError, ScreenshotOptions, Text2ImgRender
 from .storage import create_image_storage
 from .util import cleanup_expired_files
 
@@ -260,7 +260,37 @@ async def text2img(request: GenerateRequest):
         )
     )
 
-    pic = await render.html2pic(abs_path, options)
+    try:
+        pic = await render.html2pic(abs_path, options)
+    except Exception as e:
+        try:
+            options_dump = options.model_dump(exclude_none=True)
+        except Exception as dump_error:
+            logger.warning(f"failed to dump screenshot options: {dump_error}")
+            options_dump = {}
+
+        return_mode = "json" if is_json_return else "file"
+        logger.exception(
+            "render failed: "
+            f"abs_path={abs_path}, options={options_dump}, return_mode={return_mode}"
+        )
+
+        error_data = {
+            "error_type": type(e).__name__,
+            "html_file": os.path.basename(abs_path),
+            "options": options_dump,
+        }
+        if isinstance(e, RenderError):
+            error_data["stage"] = e.stage
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "code": 1,
+                "message": f"render error: {str(e)}",
+                "data": error_data,
+            },
+        )
 
     media_type = "image/png" if pic.endswith(".png") else "image/jpeg"
 

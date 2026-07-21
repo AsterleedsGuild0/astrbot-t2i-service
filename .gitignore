@@ -162,3 +162,7 @@ venv
 cache.json
 
 data/
+
+.opencode
+.idea
+

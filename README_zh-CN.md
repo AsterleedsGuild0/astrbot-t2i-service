@@ -11,6 +11,9 @@
 - `PORT`: 服务端口，默认 8999
 - `IMAGE_LIFETIME_HOURS`: 图片生命时间（小时），默认 24 小时。超过此时间的图片文件将被自动清理
 - `STORAGE_BACKEND`: 图片存储后端，支持 `local`（默认）、`s3` 和 `r2`
+- `T2I_RENDER_WAIT_UNTIL`: Playwright 页面导航等待策略，默认 `domcontentloaded`
+- `T2I_SKIP_FONT_READY`: 是否跳过 Playwright 截图前内部的 `document.fonts.ready` 等待，默认 `true`
+- `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_SECONDS`: 进程内限流配置，两个值都大于 0 时启用
 
 ### Cloudflare R2 / S3 兼容对象存储
 
@@ -44,6 +47,7 @@ html 转 img
 - `bool` json: 是否返回 json 格式（返回一个 id）
 - `dict` `optional` options
   - timeout (float, optional): 截图超时时间.
+  - wait_until (Literal["commit", "domcontentloaded", "load", "networkidle"], optional): 页面导航等待状态，默认使用服务端 `T2I_RENDER_WAIT_UNTIL` 配置.
   - type (Literal["jpeg", "png"], optional): 截图图片类型.
   - quality (int, optional): 截图质量，仅适用于 JPEG 格式图片.
   - omit_background (bool, optional): 是否允许隐藏默认的白色背景，这样就可以截透明图了，仅适用于 PNG 格式
@@ -68,3 +72,7 @@ html 转 img
 ### GET /text2img/data/{id}
 
 根据 id 返回对应的图像。
+
+## Docker 渲染说明
+
+容器镜像会安装 `fonts-noto-cjk` 与 `fonts-noto-color-emoji`，以提升中文与 emoji 的渲染稳定性。
