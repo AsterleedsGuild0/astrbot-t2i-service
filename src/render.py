@@ -58,6 +58,15 @@ def _env_wait_until() -> WaitUntil:
 DEFAULT_RENDER_WAIT_UNTIL = _env_wait_until()
 SKIP_FONT_READY = _env_flag("T2I_SKIP_FONT_READY", True)
 
+# 调用方未指定 device_scale_factor_level 时使用的默认等级。
+# 取 high(1.3x) 而非 normal(1.0x)：清晰度上限由真实像素数决定，1.0x 无超采样时
+# 文字抗锯齿细节最少，是观感模糊的主要来源之一。
+DEFAULT_SCALE_LEVEL = "high"
+
+# JPEG 质量下限。部分调用方（如 AstrBot 默认的 quality=40）为省流量传入过低的质量，
+# 会让文字边缘产生明显的块状压缩失真。低于此值时统一抬升到下限。
+MIN_JPEG_QUALITY = 70
+
 # Playwright 默认会在截图前等待 document.fonts.ready。服务端场景中若远程字体
 # 加载缓慢或不可达，可能导致截图阶段超时。该开关允许在需要时跳过这一步等待。
 if SKIP_FONT_READY:
@@ -87,6 +96,7 @@ class ScreenshotOptions(BaseModel):
         type (Literal["jpeg", "png"], optional): 截图图片类型.
         path (Union[str, Path]], optional): 截图保存路径，如不需要则留空.
         quality (int, optional): 截图质量，仅适用于 JPEG 格式图片.
+            低于 MIN_JPEG_QUALITY(70) 或未指定时会被抬升到该下限，避免文字出现压缩失真.
         omit_background (bool, optional): 是否允许隐藏默认的白色背景，这样就可以截透明图了，仅适用于 PNG 格式.
         full_page (bool, optional): 是否截整个页面而不是仅设置的视口大小，默认为 True.
         clip (FloatRect, optional): 截图后裁切的区域，xy为起点.
@@ -107,6 +117,7 @@ class ScreenshotOptions(BaseModel):
             2. 从 HTML 的 <meta name="viewport" content="height=..."> 自动解析；
             3. 未指定时默认为 720px.
         device_scale_factor_level: (Literal["normal", "high", "ultra"], optional): 设备像素比等级.
+            未指定时默认为 DEFAULT_SCALE_LEVEL("high").
             - normal: 1.0
             - high: 1.3
             - ultra: 1.8
@@ -145,18 +156,20 @@ class Text2ImgRender:
         logger.info(
             "Text2ImgRender config: "
             f"default_wait_until={DEFAULT_RENDER_WAIT_UNTIL}, "
-            f"skip_font_ready={SKIP_FONT_READY}"
+            f"skip_font_ready={SKIP_FONT_READY}, "
+            f"default_scale_level={DEFAULT_SCALE_LEVEL}, "
+            f"min_jpeg_quality={MIN_JPEG_QUALITY}"
         )
 
     def _resolve_wait_until(self, wait_until: WaitUntil | None) -> WaitUntil:
         return wait_until or DEFAULT_RENDER_WAIT_UNTIL
 
-    async def _ensure_context(self, level: str = "normal") -> BrowserContext:
+    async def _ensure_context(self, level: str = DEFAULT_SCALE_LEVEL) -> BrowserContext:
         """Ensure that Playwright, Browser and BrowserContext are initialized.
 
         Args:
             level: Device scale factor level ("normal", "high", or "ultra").
-                   Defaults to "normal" if not specified.
+                   Defaults to DEFAULT_SCALE_LEVEL if not specified.
 
         Returns:
             The BrowserContext for the specified level.
@@ -280,7 +293,7 @@ class Text2ImgRender:
         self, html_file_path: str, screenshot_options: ScreenshotOptions
     ) -> str:
         # Determine which context to use based on device_scale_factor_level
-        level = screenshot_options.device_scale_factor_level or "normal"
+        level = screenshot_options.device_scale_factor_level or DEFAULT_SCALE_LEVEL
         suffix = screenshot_options.type if screenshot_options.type else "png"
         started = time.perf_counter()
         result = "error"
@@ -431,6 +444,15 @@ class Text2ImgRender:
                 # Robustness: Remove quality if type is png, as Playwright errors out
                 if screenshot_options.type == "png":
                     screenshot_kwargs.pop("quality", None)
+                elif screenshot_options.type == "jpeg":
+                    # 抬升过低的 JPEG 质量，避免文字边缘出现块状压缩失真
+                    quality = screenshot_kwargs.get("quality")
+                    if quality is None or quality < MIN_JPEG_QUALITY:
+                        logger.info(
+                            "html2pic: raise jpeg quality from "
+                            f"{quality} to {MIN_JPEG_QUALITY}"
+                        )
+                        screenshot_kwargs["quality"] = MIN_JPEG_QUALITY
 
                 logger.info(
                     "html2pic screenshot start: "

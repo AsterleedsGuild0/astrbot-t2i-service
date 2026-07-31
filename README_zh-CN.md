@@ -49,7 +49,7 @@ html 转 img
   - timeout (float, optional): 截图超时时间.
   - wait_until (Literal["commit", "domcontentloaded", "load", "networkidle"], optional): 页面导航等待状态，默认使用服务端 `T2I_RENDER_WAIT_UNTIL` 配置.
   - type (Literal["jpeg", "png"], optional): 截图图片类型.
-  - quality (int, optional): 截图质量，仅适用于 JPEG 格式图片.
+  - quality (int, optional): 截图质量，仅适用于 JPEG 格式图片. 服务端强制下限为 70，低于该值或未指定时会被抬升，以避免文字边缘出现块状压缩失真.
   - omit_background (bool, optional): 是否允许隐藏默认的白色背景，这样就可以截透明图了，仅适用于 PNG 格式
   - full_page (bool, optional): 是否截整个页面而不是仅设置的视口大小，默认为 True.
   - clip (FloatRect, optional): 截图后裁切的区域，xy为起点.
@@ -64,9 +64,9 @@ html 转 img
       1. 在请求 options 中显式指定
       2. 从 HTML 的 `<meta name="viewport" content="height=...">` 自动解析
       3. 未指定时默认为 720px
-    - device_scale_factor_level (Literal["normal", "high", "ultra"], optional): 设备像素比等级，默认为 "normal". 不同等级使用独立的浏览器上下文池，提供更好的性能和资源隔离.
-      - `normal`: 设备像素比 1.0（默认）
-      - `high`: 设备像素比 1.3
+    - device_scale_factor_level (Literal["normal", "high", "ultra"], optional): 设备像素比等级，未指定时默认为 "high". 不同等级使用独立的浏览器上下文池，提供更好的性能和资源隔离.
+      - `normal`: 设备像素比 1.0
+      - `high`: 设备像素比 1.3（默认）
       - `ultra`: 设备像素比 1.8
 
 ### GET /text2img/data/{id}
