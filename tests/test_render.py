@@ -20,6 +20,12 @@ class FakePage:
     async def goto(self, url, timeout=None, wait_until=None):
         return None
 
+    async def evaluate(self, script):
+        return {
+            "width": self.viewport["width"],
+            "height": self.viewport["height"],
+        }
+
     async def screenshot(self, path, **kwargs):
         self.recorder.update(kwargs)
         with open(path, "wb") as f:
