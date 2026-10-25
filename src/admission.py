@@ -54,7 +54,7 @@ class RenderAdmissionMiddleware:
                 return await reject(error.status_code, str(error), error.stage)
 
             # Buffer only the admitted body, with a byte limit even for chunked uploads.
-            messages = []
+            body = bytearray()
             size = 0
             try:
                 async with asyncio.timeout(LIMITS.body_timeout):
@@ -67,20 +67,20 @@ class RenderAdmissionMiddleware:
                         size += len(message.get("body", b""))
                         if size > LIMITS.max_request_bytes:
                             return await reject(413, "Request exceeds T2I_MAX_REQUEST_BYTES", "request_body")
-                        messages.append(message)
+                        body.extend(message.get("body", b""))
                         if not message.get("more_body", False):
                             break
             except TimeoutError:
                 return await reject(408, "Timed out reading the request body", "request_body")
 
-            index = 0
+            body = bytes(body)
+            delivered = False
 
             async def replay_receive():
-                nonlocal index
-                if index < len(messages):
-                    message = messages[index]
-                    index += 1
-                    return message
+                nonlocal delivered
+                if not delivered:
+                    delivered = True
+                    return {"type": "http.request", "body": body, "more_body": False}
                 return await receive()
 
             return await self.app(scope, replay_receive, send)

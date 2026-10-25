@@ -7,6 +7,8 @@ __pycache__
 *.pyc
 *.log
 *.log.*
+**/*.log
+**/*.log.*
 *.tar
 .env
 .env.*
