@@ -76,3 +76,48 @@ html 转 img
 ## Docker 渲染说明
 
 容器镜像会安装 `fonts-noto-cjk` 与 `fonts-noto-color-emoji`，以提升中文与 emoji 的渲染稳定性。
+
+### 小内存服务器的资源保护
+
+仓库的 `compose.yaml` 提供 768 MiB 内存、1 核 CPU、256 PID 和日志轮转的起始预算，
+并把最高缩放档位设为 `normal`。这是止损配置，不是已经验证适合所有长图的容量；
+过大的报告可能被拒绝或触发容器内 OOM。请按实际峰值调整，不要取消容器硬上限。
+
+服务端每进程只渲染一个任务，在解析请求体之前限制排队。默认保护参数：
+
+- `T2I_MAX_QUEUE_SIZE=2`、`T2I_QUEUE_TIMEOUT_SECONDS=10`：最多两个等待请求，超额或等待超时返回 503。
+- `T2I_MAX_REQUEST_BYTES=8388608`、`T2I_BODY_TIMEOUT_SECONDS=15`：限制实际请求体字节数和上传耗时，包括分块请求。
+- `T2I_MAX_HTML_BYTES=4194304`：限制输入模板、HTML 和模板展开后的 UTF-8 大小。
+- `T2I_TEMPLATE_TIMEOUT_SECONDS=10`、`T2I_TEMPLATE_MEMORY_MB=256`：模板在独立子进程生成；Linux 下额外限制其地址空间与 CPU 时间，超时终止子进程。
+- `T2I_OPERATION_TIMEOUT_MS=30000`：导航和截图的单步超时上限；调用方传入 0 或更大的值也不会关闭此保护。
+- `T2I_RENDER_TIMEOUT_SECONDS=45`、`T2I_CLEANUP_TIMEOUT_SECONDS=3`：浏览器阶段总截止时间，以及每项资源回收的等待上限。回收耗时另计，严重系统卡顿时无法保证墙钟时间。
+- `T2I_MAX_SCALE_LEVEL=high`：服务端默认最高允许 high，显式 ultra 也会被降到此上限；可设置为 normal/high/ultra。
+- `T2I_MAX_VIEWPORT_DIMENSION=4096`：视口任一边的 CSS 像素上限。
+- `T2I_MAX_SCREENSHOT_PIXELS=16000000`、`T2I_MAX_SCREENSHOT_DIMENSION=16384`：截图前测量实际文档，限制预计物理像素面积和单边长度。整页截图同时检查完整栅格表面，即使指定 clip 或 CSS scale 也不能绕过。
+- `T2I_BROWSER_MAX_RENDERS=100`：在任务边界定期回收浏览器，避免上下文长期积累。
+- `T2I_MIN_AVAILABLE_MEMORY_MB=128`、`T2I_MIN_FREE_DISK_MB=128`：低于主机可用内存或磁盘空间预留值时拒绝新渲染；设置了 cgroup 内存上限时，达到其 90% 也拒绝新任务。
+- `T2I_MAX_PAGE_EVENT_LOGS=20`：每个页面的事件日志上限，避免失效资源产生大量重复日志。
+
+预算超限返回 413，资源不足或排队失败返回 503，浏览器总超时返回 504，磁盘空间不足返回 507。
+错误仍使用 `code/message/data` 结构，`data.stage` 标明失败阶段。不会为了通过预算而静默裁掉长图。
+直接返回图片时在传输结束后删除临时图片，HTML 在请求结束后删除；JSON 模式的本地图片继续按生命周期清理。
+
+`GET /healthz` 在资源回收失败后返回 503；此时服务拒绝新渲染，避免反复启动浏览器造成进程积累。
+需要检查容器并重启恢复；Docker 的 `restart` 策略不会仅因为 unhealthy 就自动重启。
+客户端断开时会取消截图并尝试有界回收浏览器，应用退出时也会停止清理任务和浏览器。
+
+这些保护不是不可信 HTML 的完整隔离方案：JavaScript、外链资源解码以及测量后变化的页面仍可能产生额外开销。
+请保留容器内存/CPU/PID 硬上限，并通过防火墙或反向代理限制调用来源。增加 Uvicorn worker 或部署多个副本会分别创建浏览器和排队槽位，需要重新计算总预算。
+
+### 构建与发布
+
+推送到 `main` 或在 Actions 手动运行 **Build and publish GHCR image**，会在原生 amd64/arm64 runner 上构建并发布到 `ghcr.io/<仓库所有者>/<仓库名>`。
+使用仓库内置的 `GITHUB_TOKEN` 和 `packages: write` 权限，不需要配置额外 PAT。
+
+发布标签包括北京时间版本号（附运行 ID）、`sha-<12位提交号>`，以及 main 分支的 `latest`。
+两种架构全部构建成功后才更新多架构标签；发布阶段只检查 registry manifest，不拉取或启动镜像，不运行测试。
+Dockerfile 只做 Python 字节码编译检查，构建成功不代表功能或资源峰值已验证。
+原有 **Build Docker Image Archives** 手动工作流仍保留，用于按需导出 tar。
+
+首次发布的 GHCR 包可能需要在 GitHub Packages 中配置访问权限；公开部署前请确认包的可见性。
+部署时可通过 `T2I_IMAGE` 指定不可变 SHA 标签代替 latest，再使用现有 Compose 流程更新。
