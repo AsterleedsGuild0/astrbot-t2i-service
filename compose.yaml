@@ -1,0 +1,23 @@
+name: astrbot-t2i
+
+services:
+  astrbot-t2i-service:
+    image: ${T2I_IMAGE:-ghcr.io/asterleedsguild0/astrbot-t2i-service:latest}
+    container_name: astrbot-t2i-service
+    command: ["python", "main.py"]
+    ports:
+      - "9001:8999"
+    init: true
+    mem_limit: 768m
+    memswap_limit: 768m
+    cpus: "1.0"
+    pids_limit: 256
+    environment:
+      T2I_MAX_SCALE_LEVEL: normal
+      T2I_MAX_SCREENSHOT_PIXELS: "16000000"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
