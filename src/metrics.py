@@ -125,6 +125,15 @@ RENDER_VIEWPORT_PIXELS = _metric(
     ),
 )
 
+RENDER_SCREENSHOT_PIXELS = _metric(
+    Histogram,
+    "t2i_render_screenshot_pixels",
+    "Estimated output pixels after measuring document or clip dimensions.",
+    ("scale",),
+    buckets=(250_000, 1_000_000, 4_000_000, 8_000_000, 16_000_000),
+)
+
+
 BROWSER_CONNECTED = _metric(
     Gauge,
     "t2i_browser_connected",

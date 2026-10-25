@@ -1,15 +1,22 @@
+import asyncio
 import os
 import re
 import time
 
-from jinja2.sandbox import SandboxedEnvironment
 from loguru import logger
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Browser, BrowserContext, Playwright, async_playwright
-from pydantic import BaseModel
-from typing import Literal, cast
+from pydantic import BaseModel, Field
+from typing import Annotated, Literal, cast
 from typing_extensions import TypedDict
 
+from .limits import (
+    LIMITS,
+    ResourceLimitError,
+    check_html_size,
+    check_runtime_resources,
+    check_screenshot_size,
+)
 from .metrics import (
     BROWSER_CONNECTED,
     BROWSER_CONTEXTS,
@@ -20,8 +27,10 @@ from .metrics import (
     RENDER_IN_PROGRESS,
     RENDER_OUTPUT_BYTES,
     RENDER_REQUESTS,
+    RENDER_SCREENSHOT_PIXELS,
     RENDER_VIEWPORT_PIXELS,
 )
+from .template import render_template
 from .util import generate_data_path
 
 WaitUntil = Literal["commit", "domcontentloaded", "load", "networkidle"]
@@ -74,16 +83,17 @@ if SKIP_FONT_READY:
 
 
 class RenderError(RuntimeError):
-    def __init__(self, stage: str, message: str):
+    def __init__(self, stage: str, message: str, status_code: int = 500):
         super().__init__(message)
         self.stage = stage
+        self.status_code = status_code
 
 
 class FloatRect(TypedDict):
-    x: float
-    y: float
-    width: float
-    height: float
+    x: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    y: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    width: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    height: Annotated[float, Field(gt=0, allow_inf_nan=False)]
 
 
 class ScreenshotOptions(BaseModel):
@@ -125,18 +135,18 @@ class ScreenshotOptions(BaseModel):
     @author: Redlnn(https://github.com/GraiaCommunity/graiax-text2img-playwright)
     """
 
-    timeout: float | None = None
+    timeout: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     wait_until: WaitUntil | None = DEFAULT_RENDER_WAIT_UNTIL
     type: Literal["jpeg", "png", None] = None
-    quality: int | None = None
+    quality: int | None = Field(default=None, ge=0, le=100)
     omit_background: bool | None = None
     full_page: bool | None = True
     clip: FloatRect | None = None
     animations: Literal["allow", "disabled", None] = None
     caret: Literal["hide", "initial", None] = None
     scale: Literal["css", "device", None] = None
-    viewport_width: int | None = None
-    viewport_height: int | None = None
+    viewport_width: int | None = Field(default=None, gt=0)
+    viewport_height: int | None = Field(default=None, gt=0)
     device_scale_factor_level: Literal["normal", "high", "ultra", None] = None
 
 
@@ -153,12 +163,15 @@ class Text2ImgRender:
         self.browser: Browser | None = None
         # Context pool: {"normal": context, "high": context, "ultra": context}
         self.contexts: dict[str, BrowserContext] = {}
+        self._render_lock = asyncio.Lock()
+        self._completed_renders = 0
+        self._unhealthy = False
         logger.info(
             "Text2ImgRender config: "
             f"default_wait_until={DEFAULT_RENDER_WAIT_UNTIL}, "
             f"skip_font_ready={SKIP_FONT_READY}, "
             f"default_scale_level={DEFAULT_SCALE_LEVEL}, "
-            f"min_jpeg_quality={MIN_JPEG_QUALITY}"
+            f"min_jpeg_quality={MIN_JPEG_QUALITY}, limits={LIMITS}"
         )
 
     def _resolve_wait_until(self, wait_until: WaitUntil | None) -> WaitUntil:
@@ -180,10 +193,12 @@ class Text2ImgRender:
         # ensure browser launched
         if self.browser is None or not self.browser.is_connected():
             if self.browser is not None:
-                try:
-                    await self.browser.close()
-                except Exception as e:
-                    logger.debug(f"Close old browser failed: {e}")
+                # A disconnected browser invalidates every cached context.
+                if not await self.terminate():
+                    raise RenderError("cleanup", "Old browser could not be stopped", 503)
+                self.playwright = await async_playwright().start()
+            self.contexts.clear()
+            BROWSER_CONTEXTS.set(0)
             self.browser = await self.playwright.chromium.launch(headless=True)
             BROWSER_STARTS.inc()
             BROWSER_CONNECTED.set(1)
@@ -202,11 +217,11 @@ class Text2ImgRender:
         return self.contexts[level]
 
     async def from_jinja_template(self, template: str, data: dict) -> tuple[str, str]:
-        env = SandboxedEnvironment()
-        html = env.from_string(template).render(data)
+        html = await render_template(template, data)
         return await self.from_html(html)
 
     async def from_html(self, html: str) -> tuple[str, str]:
+        check_html_size(html)
         html_file_path, abs_path = generate_data_path(
             suffix="html", namespace="rendered"
         )
@@ -262,34 +277,103 @@ class Text2ImgRender:
 
         return viewport_width, viewport_height
 
-    async def terminate(self) -> None:
-        """Terminate Playwright and close browser."""
-        # Close all contexts in the pool
-        for level, context in list(self.contexts.items()):
-            try:
-                await context.close()
-                logger.debug(f"Closed context for level '{level}'")
-            except Exception as e:
-                logger.debug(f"Close context for level '{level}' failed: {e}")
+    async def terminate(self) -> bool:
+        """Stop the browser with bounded waits; fail closed if cleanup is uncertain."""
+        self._unhealthy = True
+        browser, playwright = self.browser, self.playwright
+        contexts = list(self.contexts.values())
+        self.browser = None
+        self.playwright = None
         self.contexts.clear()
         BROWSER_CONTEXTS.set(0)
-
-        if self.browser is not None:
-            try:
-                await self.browser.close()
-            except Exception as e:
-                logger.debug(f"Close browser failed: {e}")
-            self.browser = None
         BROWSER_CONNECTED.set(0)
+        stopped = True
+        try:
+            if browser is not None:
+                await asyncio.wait_for(browser.close(), LIMITS.cleanup_timeout)
+            elif contexts:
+                await asyncio.wait_for(
+                    asyncio.gather(*(context.close() for context in contexts)),
+                    LIMITS.cleanup_timeout,
+                )
+        except Exception as error:
+            stopped = False
+            logger.error(f"Browser cleanup failed: {type(error).__name__}: {error}")
+        try:
+            if playwright is not None:
+                await asyncio.wait_for(playwright.stop(), LIMITS.cleanup_timeout)
+        except Exception as error:
+            stopped = False
+            logger.error(f"Playwright cleanup failed: {type(error).__name__}: {error}")
+        self._unhealthy = not stopped
+        self._completed_renders = 0
+        return stopped
 
-        if self.playwright is not None:
-            try:
-                await self.playwright.stop()
-            except Exception as e:
-                logger.debug(f"Stop Playwright failed: {e}")
-            self.playwright = None
+    async def _close_page(self, page) -> None:
+        try:
+            await asyncio.wait_for(page.close(), LIMITS.cleanup_timeout)
+        except Exception as error:
+            raise RenderError(
+                "cleanup", "Page cleanup failed; recycling browser", 503
+            ) from error
+
+    def _effective_options(self, options: ScreenshotOptions) -> ScreenshotOptions:
+        options = options.model_copy()
+        requested_level = options.device_scale_factor_level or DEFAULT_SCALE_LEVEL
+        if (
+            self.SCALE_FACTOR_MAP[requested_level]
+            > self.SCALE_FACTOR_MAP[LIMITS.max_scale_level]
+        ):
+            logger.info(
+                f"Limit render scale from {requested_level} to {LIMITS.max_scale_level}"
+            )
+            requested_level = LIMITS.max_scale_level
+        options.device_scale_factor_level = requested_level
+        options.timeout = min(
+            options.timeout or LIMITS.operation_timeout_ms, LIMITS.operation_timeout_ms
+        )
+        if options.animations is None:
+            options.animations = "disabled"
+        return options
 
     async def html2pic(
+        self, html_file_path: str, screenshot_options: ScreenshotOptions
+    ) -> str:
+        # Keep recovery and browser recycling exclusive, even for non-HTTP callers.
+        async with self._render_lock:
+            if self._unhealthy:
+                raise RenderError("cleanup", "Renderer is unhealthy; restart the container", 503)
+            check_runtime_resources()
+            if self._completed_renders >= LIMITS.browser_max_renders:
+                BROWSER_RESTARTS.labels(reason="render_budget").inc()
+                if not await self.terminate():
+                    raise RenderError("cleanup", "Browser recycling failed; restart the container", 503)
+            options = self._effective_options(screenshot_options)
+            try:
+                async with asyncio.timeout(LIMITS.render_timeout):
+                    return await self._html2pic(html_file_path, options)
+            except TimeoutError as error:
+                BROWSER_RESTARTS.labels(reason="deadline").inc()
+                await self.terminate()
+                raise RenderError("deadline", "Render exceeded T2I_RENDER_TIMEOUT_SECONDS", 504) from error
+            except RenderError:
+                BROWSER_RESTARTS.labels(reason="render_error").inc()
+                await self.terminate()
+                raise
+            except asyncio.CancelledError:
+                BROWSER_RESTARTS.labels(reason="cancelled").inc()
+                await self.terminate()
+                raise
+            except ResourceLimitError:
+                raise
+            except Exception:
+                BROWSER_RESTARTS.labels(reason="unexpected_error").inc()
+                await self.terminate()
+                raise
+            finally:
+                self._completed_renders += 1
+
+    async def _html2pic(
         self, html_file_path: str, screenshot_options: ScreenshotOptions
     ) -> str:
         # Determine which context to use based on device_scale_factor_level
@@ -298,6 +382,7 @@ class Text2ImgRender:
         started = time.perf_counter()
         result = "error"
         page = None
+        result_path = None
         RENDER_IN_PROGRESS.inc()
         try:
             context = await self._ensure_context(level)
@@ -305,21 +390,8 @@ class Text2ImgRender:
 
             try:
                 page = await context.new_page()
-            except TargetClosedError as e:
-                BROWSER_RESTARTS.labels(reason="target_closed").inc()
-                logger.warning(
-                    f"html2pic: Failed to create new page, restarting browser context: {e}"
-                )
-                # Close and remove the specific context, then recreate it
-                if level in self.contexts:
-                    try:
-                        await self.contexts[level].close()
-                    except Exception:
-                        pass
-                    del self.contexts[level]
-                    BROWSER_CONTEXTS.set(len(self.contexts))
-                context = await self._ensure_context(level)
-                page = await context.new_page()
+            except TargetClosedError as error:
+                raise RenderError("browser", "Browser context closed before rendering", 503) from error
             RENDER_ACTIVE_PAGES.inc()
 
             wait_until = self._resolve_wait_until(screenshot_options.wait_until)
@@ -343,7 +415,15 @@ class Text2ImgRender:
                     return "no_detail"
                 return _truncate(str(failure))
 
+            event_logs = 0
+
             def _log_render_event(event: str, level_name: str = "warning", **details) -> None:
+                nonlocal event_logs
+                event_logs += 1
+                if event_logs > LIMITS.max_page_event_logs:
+                    if event_logs == LIMITS.max_page_event_logs + 1:
+                        logger.warning(f"Further page events suppressed for {html_file_path}")
+                    return
                 log_func = getattr(logger, level_name, logger.warning)
                 log_func(
                     "html2pic page event: "
@@ -406,6 +486,9 @@ class Text2ImgRender:
             width = viewport_width if viewport_width is not None else 800
             height = viewport_height if viewport_height is not None else 720
             scale_factor = self.SCALE_FACTOR_MAP.get(level, 1.0)
+            if min(width, height) <= 0 or max(width, height) > LIMITS.max_viewport_dimension:
+                raise ResourceLimitError("Viewport exceeds T2I_MAX_VIEWPORT_DIMENSION")
+            check_screenshot_size(width, height, scale_factor)
             RENDER_VIEWPORT_PIXELS.labels(scale=level).observe(
                 width * height * scale_factor * scale_factor
             )
@@ -427,8 +510,8 @@ class Text2ImgRender:
                         wait_until=wait_until,
                     )
                 except Exception as e:
-                    logger.exception(
-                        "html2pic goto failed: "
+                    logger.warning(
+                        f"html2pic goto failed: {type(e).__name__}: {e}; "
                         f"html_file_path={html_file_path}, timeout={screenshot_options.timeout}, "
                         f"wait_until={wait_until}, full_page={screenshot_options.full_page}, "
                         f"type={screenshot_options.type}, device_scale_factor_level={level}"
@@ -442,9 +525,9 @@ class Text2ImgRender:
                 screenshot_kwargs.pop("device_scale_factor_level", None)
 
                 # Robustness: Remove quality if type is png, as Playwright errors out
-                if screenshot_options.type == "png":
+                if suffix == "png":
                     screenshot_kwargs.pop("quality", None)
-                elif screenshot_options.type == "jpeg":
+                elif suffix == "jpeg":
                     # 抬升过低的 JPEG 质量，避免文字边缘出现块状压缩失真
                     quality = screenshot_kwargs.get("quality")
                     if quality is None or quality < MIN_JPEG_QUALITY:
@@ -453,6 +536,43 @@ class Text2ImgRender:
                             f"{quality} to {MIN_JPEG_QUALITY}"
                         )
                         screenshot_kwargs["quality"] = MIN_JPEG_QUALITY
+
+                check_runtime_resources()
+                dimensions = await page.evaluate(
+                    """() => {
+                        const root = document.documentElement;
+                        const body = document.body;
+                        return {
+                            width: Math.max(root.scrollWidth, root.offsetWidth, root.clientWidth,
+                                body ? body.scrollWidth : 0, body ? body.offsetWidth : 0),
+                            height: Math.max(root.scrollHeight, root.offsetHeight, root.clientHeight,
+                                body ? body.scrollHeight : 0, body ? body.offsetHeight : 0)
+                        };
+                    }"""
+                )
+                capture_width = dimensions["width"] if screenshot_options.full_page else width
+                capture_height = dimensions["height"] if screenshot_options.full_page else height
+                if screenshot_options.full_page:
+                    # Include the full raster surface for clipped or CSS-scaled output.
+                    check_screenshot_size(
+                        dimensions["width"], dimensions["height"], scale_factor
+                    )
+                if screenshot_options.clip:
+                    clip = screenshot_options.clip
+                    if (
+                        clip["x"] + clip["width"] > dimensions["width"]
+                        or clip["y"] + clip["height"] > dimensions["height"]
+                    ):
+                        raise ResourceLimitError("Screenshot clip exceeds document bounds")
+                    capture_width = clip["width"]
+                    capture_height = clip["height"]
+                output_scale = 1.0 if screenshot_options.scale == "css" else scale_factor
+                pixels = check_screenshot_size(capture_width, capture_height, output_scale)
+                RENDER_SCREENSHOT_PIXELS.labels(scale=level).observe(pixels)
+                logger.info(
+                    f"html2pic measured size={capture_width}x{capture_height}, "
+                    f"output_scale={output_scale}, pixels={pixels}"
+                )
 
                 logger.info(
                     "html2pic screenshot start: "
@@ -463,21 +583,19 @@ class Text2ImgRender:
                 try:
                     await page.screenshot(path=result_path, **screenshot_kwargs)
                 except Exception as e:
-                    logger.exception(
-                        "html2pic screenshot failed: "
+                    logger.warning(
+                        f"html2pic screenshot failed: {type(e).__name__}: {e}; "
                         f"html_file_path={html_file_path}, timeout={screenshot_options.timeout}, "
                         f"wait_until={wait_until}, full_page={screenshot_options.full_page}, "
                         f"type={screenshot_options.type}, device_scale_factor_level={level}"
                     )
                     raise RenderError("screenshot", f"page.screenshot failed: {e}") from e
             finally:
-                # Ensure the page is closed to free resources
                 try:
-                    await page.close()
-                except Exception as e:
-                    logger.debug(f"html2pic: close page failed: {e}")
-                page = None
-                RENDER_ACTIVE_PAGES.dec()
+                    await self._close_page(page)
+                finally:
+                    page = None
+                    RENDER_ACTIVE_PAGES.dec()
 
             RENDER_OUTPUT_BYTES.labels(format=suffix).observe(
                 os.path.getsize(result_path)
@@ -486,11 +604,21 @@ class Text2ImgRender:
             logger.info(f"Rendered {html_file_path} to {result_path}")
             return result_path
         finally:
+            cleanup_error = None
             if page is not None:
                 try:
-                    await page.close()
+                    await self._close_page(page)
+                except RenderError as error:
+                    cleanup_error = error
                 finally:
                     RENDER_ACTIVE_PAGES.dec()
+            if result != "success" and result_path is not None:
+                try:
+                    os.unlink(result_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    logger.warning(f"Failed to remove incomplete image: {error}")
             if self.browser is None or not self.browser.is_connected():
                 BROWSER_CONNECTED.set(0)
             RENDER_REQUESTS.labels(
@@ -502,3 +630,5 @@ class Text2ImgRender:
                 time.perf_counter() - started
             )
             RENDER_IN_PROGRESS.dec()
+            if cleanup_error is not None:
+                raise cleanup_error

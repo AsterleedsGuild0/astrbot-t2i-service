@@ -3,6 +3,8 @@ import os
 import secrets
 import time
 from collections import deque
+from contextlib import suppress
+from pathlib import Path
 
 import fastapi
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +13,10 @@ from jinja2.exceptions import SecurityError
 from loguru import logger
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
+from .admission import RenderAdmissionMiddleware
+from .limits import LIMITS, ResourceLimitError, check_html_size, check_runtime_resources
 from .metrics import (
     CLEANUP_DURATION,
     CLEANUP_FILES,
@@ -30,6 +35,7 @@ from .storage import create_image_storage
 from .util import cleanup_expired_files
 
 app = fastapi.FastAPI()
+app.add_middleware(RenderAdmissionMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -100,8 +106,26 @@ class GenerateRequest(BaseModel):
 async def startup_event():
     """应用启动时的事件处理"""
     # 启动定期清理任务
-    asyncio.create_task(periodic_cleanup())
+    app.state.cleanup_task = asyncio.create_task(periodic_cleanup())
     logger.info("Started periodic cleanup task")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    cleanup_task = getattr(app.state, "cleanup_task", None)
+    if cleanup_task is not None:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
+    await render.terminate()
+
+
+@app.get("/healthz", include_in_schema=False)
+async def health_check():
+    return JSONResponse(
+        status_code=503 if render._unhealthy else 200,
+        content={"status": "unhealthy" if render._unhealthy else "ok"},
+    )
 
 
 async def periodic_cleanup():
@@ -189,8 +213,66 @@ async def text2img_image(id: str):
     return Response(content=image.content, media_type=image.media_type)
 
 
+def remove_temporary_file(path: str) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError as error:
+        logger.warning(f"Failed to remove temporary file {path}: {error}")
+
+
+async def render_with_disconnect(http_request, abs_path, options):
+    if http_request is None:
+        return await render.html2pic(abs_path, options)
+
+    async def wait_for_disconnect():
+        while True:
+            if await http_request.is_disconnected():
+                raise RenderError("client_disconnect", "Client disconnected during rendering", 499)
+            await asyncio.sleep(0.25)
+
+    render_task = asyncio.create_task(render.html2pic(abs_path, options))
+    disconnect_task = asyncio.create_task(wait_for_disconnect())
+    try:
+        done, _ = await asyncio.wait(
+            (render_task, disconnect_task), return_when=asyncio.FIRST_COMPLETED
+        )
+        if render_task in done:
+            return await render_task
+        return await disconnect_task
+    finally:
+        for task in (render_task, disconnect_task):
+            if not task.done():
+                task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(render_task, disconnect_task, return_exceptions=True),
+                LIMITS.cleanup_timeout * 4,
+            )
+        except TimeoutError:
+            render._unhealthy = True
+            logger.error("Render cancellation did not finish; refusing new renders")
+
+
 @app.post("/text2img/generate")
-async def text2img(request: GenerateRequest):
+async def text2img(request: GenerateRequest, http_request: fastapi.Request = None):
+    temporary_files = []
+    try:
+        if getattr(render, "_unhealthy", False):
+            raise ResourceLimitError("Renderer is unhealthy; restart the container", 503)
+        check_runtime_resources()
+        return await generate_image(request, http_request, temporary_files)
+    except ResourceLimitError as error:
+        return JSONResponse(
+            status_code=error.status_code,
+            content={"code": 1, "message": str(error), "data": {"stage": error.stage}},
+            headers={"Retry-After": "5"} if error.status_code == 503 else None,
+        )
+    finally:
+        for path in temporary_files:
+            remove_temporary_file(path)
+
+
+async def generate_image(request: GenerateRequest, http_request, temporary_files):
     """
     html: str
     options: ScreenshotOptions
@@ -211,11 +293,25 @@ async def text2img(request: GenerateRequest):
             tmpl = request.tmpl
             source = "template"
         else:
-            tmpl = open(f"tmpl/{request.tmplname}.html", "r", encoding="utf-8").read()
+            template_root = Path("tmpl").resolve()
+            template_path = (template_root / f"{request.tmplname}.html").resolve()
+            if not template_path.is_relative_to(template_root) or not template_path.is_file():
+                return JSONResponse(
+                    status_code=400,
+                    content={"code": 1, "message": "invalid template name", "data": {}},
+                )
+            with template_path.open("rb") as template_file:
+                raw_template = template_file.read(LIMITS.max_html_bytes + 1)
+            if len(raw_template) > LIMITS.max_html_bytes:
+                raise ResourceLimitError("Template file exceeds T2I_MAX_HTML_BYTES")
+            tmpl = raw_template.decode("utf-8")
             source = "template_name"
+        check_html_size(tmpl)
         RENDER_INPUT_BYTES.labels(source=source).observe(len(tmpl.encode("utf-8")))
         try:
             _, abs_path = await render.from_jinja_template(tmpl, request.tmpldata or {})
+        except ResourceLimitError:
+            raise
         except SecurityError as e:
             return JSONResponse(
                 status_code=400,
@@ -241,6 +337,7 @@ async def text2img(request: GenerateRequest):
             status_code=400,
             content={"code": 1, "message": "html or tmpl not found", "data": {}},
         )
+    temporary_files.append(abs_path)
     options = (
         request.options
         if request.options
@@ -261,7 +358,7 @@ async def text2img(request: GenerateRequest):
     )
 
     try:
-        pic = await render.html2pic(abs_path, options)
+        pic = await render_with_disconnect(http_request, abs_path, options)
     except Exception as e:
         try:
             options_dump = options.model_dump(exclude_none=True)
@@ -270,8 +367,8 @@ async def text2img(request: GenerateRequest):
             options_dump = {}
 
         return_mode = "json" if is_json_return else "file"
-        logger.exception(
-            "render failed: "
+        logger.warning(
+            f"render failed: {type(e).__name__}: {e}; "
             f"abs_path={abs_path}, options={options_dump}, return_mode={return_mode}"
         )
 
@@ -280,16 +377,18 @@ async def text2img(request: GenerateRequest):
             "html_file": os.path.basename(abs_path),
             "options": options_dump,
         }
-        if isinstance(e, RenderError):
+        if isinstance(e, (RenderError, ResourceLimitError)):
             error_data["stage"] = e.stage
+        status_code = e.status_code if isinstance(e, (RenderError, ResourceLimitError)) else 500
 
         return JSONResponse(
-            status_code=500,
+            status_code=status_code,
             content={
                 "code": 1,
                 "message": f"render error: {str(e)}",
                 "data": error_data,
             },
+            headers={"Retry-After": "5"} if status_code == 503 else None,
         )
 
     media_type = "image/png" if pic.endswith(".png") else "image/jpeg"
@@ -322,7 +421,11 @@ async def text2img(request: GenerateRequest):
             },
         )
     else:
-        return FileResponse(pic, media_type=media_type)
+        return FileResponse(
+            pic,
+            media_type=media_type,
+            background=BackgroundTask(remove_temporary_file, pic),
+        )
 
 
 if __name__ == "__main__":
