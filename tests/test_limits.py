@@ -43,3 +43,26 @@ def test_scale_and_timeout_cannot_bypass_server_limits(monkeypatch):
     assert effective.animations == "disabled"
     assert requested.timeout == 0
     assert requested.device_scale_factor_level == "ultra"
+
+
+def test_default_scale_policy_allows_ultra(monkeypatch):
+    monkeypatch.delenv("T2I_MAX_SCALE_LEVEL", raising=False)
+    assert limits.RenderLimits.from_env().max_scale_level == "ultra"
+
+
+def test_invalid_scale_setting_uses_quality_preserving_default(monkeypatch):
+    monkeypatch.setenv("T2I_MAX_SCALE_LEVEL", "invalid")
+    assert limits.RenderLimits.from_env().max_scale_level == "ultra"
+
+
+@pytest.mark.parametrize("level", [None, "normal", "high", "ultra"])
+def test_default_policy_preserves_requested_scale_and_jpeg_quality(monkeypatch, level):
+    monkeypatch.delenv("T2I_MAX_SCALE_LEVEL", raising=False)
+    monkeypatch.setattr(render_module, "LIMITS", limits.RenderLimits.from_env())
+    requested = ScreenshotOptions(
+        type="jpeg", quality=95, device_scale_factor_level=level
+    )
+    effective = Text2ImgRender()._effective_options(requested)
+    assert effective.device_scale_factor_level == (level or render_module.DEFAULT_SCALE_LEVEL)
+    assert effective.type == "jpeg"
+    assert effective.quality == 95
