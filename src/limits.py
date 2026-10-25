@@ -41,10 +41,10 @@ class RenderLimits:
 
     @classmethod
     def from_env(cls):
-        max_scale = os.getenv("T2I_MAX_SCALE_LEVEL", "high").strip().lower()
+        max_scale = os.getenv("T2I_MAX_SCALE_LEVEL", "ultra").strip().lower()
         if max_scale not in {"normal", "high", "ultra"}:
-            logger.warning("Invalid T2I_MAX_SCALE_LEVEL; falling back to high")
-            max_scale = "high"
+            logger.warning("Invalid T2I_MAX_SCALE_LEVEL; falling back to ultra")
+            max_scale = "ultra"
         return cls(
             max_request_bytes=_env_int("T2I_MAX_REQUEST_BYTES", 8 * 1024 * 1024),
             max_html_bytes=_env_int("T2I_MAX_HTML_BYTES", 4 * 1024 * 1024),

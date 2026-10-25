@@ -80,8 +80,10 @@ html 转 img
 ### 小内存服务器的资源保护
 
 仓库的 `compose.yaml` 提供 768 MiB 内存、1 核 CPU、256 PID 和日志轮转的起始预算，
-并把最高缩放档位设为 `normal`。这是止损配置，不是已经验证适合所有长图的容量；
-过大的报告可能被拒绝或触发容器内 OOM。请按实际峰值调整，不要取消容器硬上限。
+并允许调用方使用 `ultra`，优先保留请求的分辨率、图片格式与 JPEG 质量，不默认降档。
+调用方未指定缩放等级时仍使用原有的 `high`；仅当显式配置了更低的 `T2I_MAX_SCALE_LEVEL` 时才限制缩放档位。
+这是止损预算，不是已经验证适合所有长图的容量；过大的报告会明确失败，不通过降低画质或裁切内容来绕过预算，仍可能触发容器内 OOM。
+请按实际峰值调整，不要取消容器硬上限。升级前若已在自己的 Compose 中设置 `normal` 或 `high`，需要改成 `ultra` 并重建容器；只更新镜像不会覆盖已有环境变量。
 
 服务端每进程只渲染一个任务，在解析请求体之前限制排队。默认保护参数：
 
@@ -91,7 +93,7 @@ html 转 img
 - `T2I_TEMPLATE_TIMEOUT_SECONDS=10`、`T2I_TEMPLATE_MEMORY_MB=256`：模板在独立子进程生成；Linux 下额外限制其地址空间与 CPU 时间，超时终止子进程。
 - `T2I_OPERATION_TIMEOUT_MS=30000`：导航和截图的单步超时上限；调用方传入 0 或更大的值也不会关闭此保护。
 - `T2I_RENDER_TIMEOUT_SECONDS=45`、`T2I_CLEANUP_TIMEOUT_SECONDS=3`：浏览器阶段总截止时间，以及每项资源回收的等待上限。回收耗时另计，严重系统卡顿时无法保证墙钟时间。
-- `T2I_MAX_SCALE_LEVEL=high`：服务端默认最高允许 high，显式 ultra 也会被降到此上限；可设置为 normal/high/ultra。
+- `T2I_MAX_SCALE_LEVEL=ultra`：默认允许调用方原有的 ultra 请求，不因资源保护主动降低画质；可显式设置为 normal/high/ultra。此项只控制上限，不会把调用方请求的 normal/high 自动放大。
 - `T2I_MAX_VIEWPORT_DIMENSION=4096`：视口任一边的 CSS 像素上限。
 - `T2I_MAX_SCREENSHOT_PIXELS=16000000`、`T2I_MAX_SCREENSHOT_DIMENSION=16384`：截图前测量实际文档，限制预计物理像素面积和单边长度。整页截图同时检查完整栅格表面，即使指定 clip 或 CSS scale 也不能绕过。
 - `T2I_BROWSER_MAX_RENDERS=100`：在任务边界定期回收浏览器，避免上下文长期积累。

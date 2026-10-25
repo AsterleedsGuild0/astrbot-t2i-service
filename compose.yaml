@@ -13,7 +13,7 @@ services:
     cpus: "1.0"
     pids_limit: 256
     environment:
-      T2I_MAX_SCALE_LEVEL: normal
+      T2I_MAX_SCALE_LEVEL: ultra
       T2I_MAX_SCREENSHOT_PIXELS: "16000000"
     restart: unless-stopped
     logging:
