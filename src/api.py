@@ -220,15 +220,26 @@ def remove_temporary_file(path: str) -> None:
         logger.warning(f"Failed to remove temporary file {path}: {error}")
 
 
+DISCONNECT_POLL_SECONDS = 0.25
+DISCONNECT_WATCHER_STOP_SECONDS = 1.0
+
+
 async def render_with_disconnect(http_request, abs_path, options):
     if http_request is None:
         return await render.html2pic(abs_path, options)
 
+    # The watcher is stopped with a flag, never with task.cancel(): Starlette's
+    # is_disconnected() awaits receive() inside an already-cancelled anyio
+    # CancelScope, and an external cancellation landing there is swallowed
+    # together with the scope's own, leaving the watcher polling forever.
+    stopped = asyncio.Event()
+
     async def wait_for_disconnect():
-        while True:
+        while not stopped.is_set():
             if await http_request.is_disconnected():
                 raise RenderError("client_disconnect", "Client disconnected during rendering", 499)
-            await asyncio.sleep(0.25)
+            with suppress(TimeoutError):
+                await asyncio.wait_for(stopped.wait(), DISCONNECT_POLL_SECONDS)
 
     render_task = asyncio.create_task(render.html2pic(abs_path, options))
     disconnect_task = asyncio.create_task(wait_for_disconnect())
@@ -240,17 +251,25 @@ async def render_with_disconnect(http_request, abs_path, options):
             return await render_task
         return await disconnect_task
     finally:
-        for task in (render_task, disconnect_task):
-            if not task.done():
-                task.cancel()
+        stopped.set()
+        if not render_task.done():
+            render_task.cancel()
         try:
             await asyncio.wait_for(
-                asyncio.gather(render_task, disconnect_task, return_exceptions=True),
+                asyncio.gather(render_task, return_exceptions=True),
                 LIMITS.cleanup_timeout * 4,
             )
         except TimeoutError:
+            # Only an unfinished render can leave the browser in an unknown state.
             render._unhealthy = True
             logger.error("Render cancellation did not finish; refusing new renders")
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.gather(disconnect_task, return_exceptions=True)),
+                DISCONNECT_WATCHER_STOP_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning("Disconnect watcher did not stop in time; render result is unaffected")
 
 
 @app.post("/text2img/generate")
