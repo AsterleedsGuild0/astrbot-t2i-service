@@ -1,6 +1,9 @@
 import asyncio
 import json
+from contextlib import suppress
 from pathlib import Path
+
+from starlette.requests import Request
 
 from src import api
 from src.render import RenderError
@@ -114,3 +117,79 @@ def test_generate_render_error_returns_structured_payload(tmp_path, monkeypatch)
             "stage": "goto",
         },
     }
+
+
+class WatchedRenderer:
+    """Renderer stub whose result is released by the test; tracks cancellation."""
+
+    def __init__(self, release: asyncio.Event):
+        self.release = release
+        self.cancelled = False
+        self._unhealthy = False
+
+    async def html2pic(self, html_file_path, screenshot_options):
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return "data/rendered_test.png"
+
+
+def starlette_request(receive):
+    return Request({"type": "http", "method": "POST", "path": "/", "headers": []}, receive)
+
+
+def test_watcher_that_swallows_cancellation_does_not_latch_unhealthy(monkeypatch):
+    """Regression: Starlette's is_disconnected() can swallow task.cancel() (anyio CancelScope).
+
+    A successful render must still return promptly and leave the service healthy.
+    """
+
+    async def scenario():
+        release, finish = asyncio.Event(), asyncio.Event()
+
+        class StuckRequest:
+            async def is_disconnected(self):
+                # Ignores cancellation until the test lets it go, like the swallowed case.
+                release.set()
+                while not finish.is_set():
+                    with suppress(asyncio.CancelledError):
+                        await asyncio.sleep(0.05)
+                return False
+
+        renderer = WatchedRenderer(release)
+        monkeypatch.setattr(api, "render", renderer)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(api.render_with_disconnect(StuckRequest(), "page.html", None)), 3
+            )
+        finally:
+            finish.set()
+            await asyncio.sleep(0.3)
+        return result, renderer
+
+    result, renderer = asyncio.run(scenario())
+    assert result == "data/rendered_test.png"
+    assert renderer._unhealthy is False
+
+
+def test_client_disconnect_cancels_render_and_keeps_service_healthy(monkeypatch):
+    async def scenario():
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        renderer = WatchedRenderer(asyncio.Event())
+        monkeypatch.setattr(api, "render", renderer)
+        try:
+            await asyncio.wait_for(
+                api.render_with_disconnect(starlette_request(receive), "page.html", None), 2
+            )
+        except RenderError as error:
+            return error, renderer
+        raise AssertionError("disconnect was not reported")
+
+    error, renderer = asyncio.run(scenario())
+    assert (error.stage, error.status_code) == ("client_disconnect", 499)
+    assert renderer.cancelled is True
+    assert renderer._unhealthy is False
