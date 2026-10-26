@@ -9,6 +9,7 @@
 ## 环境变量配置
 
 - `PORT`: 服务端口，默认 8999
+- `TZ`: 容器默认时区为 `Asia/Shanghai`（北京时间，UTC+8），镜像内安装 `tzdata` 并设置系统时区。已有容器需要重建才会使用新的镜像或环境变量；Docker 引擎为 `docker logs --timestamps` 添加的 UTC 时间戳不受容器 `TZ` 影响。
 - `IMAGE_LIFETIME_HOURS`: 图片生命时间（小时），默认 24 小时。超过此时间的图片文件将被自动清理
 - `STORAGE_BACKEND`: 图片存储后端，支持 `local`（默认）、`s3` 和 `r2`
 - `T2I_RENDER_WAIT_UNTIL`: Playwright 页面导航等待策略，默认 `domcontentloaded`

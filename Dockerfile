@@ -2,6 +2,7 @@ FROM python:3.13-slim-bookworm
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
+    TZ=Asia/Shanghai \
     T2I_RENDER_WAIT_UNTIL=domcontentloaded \
     T2I_SKIP_FONT_READY=true
 
@@ -11,11 +12,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps chromium \
     && apt-get update \
-    && apt-get install -y --no-install-recommends \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         fontconfig \
         fonts-noto-cjk \
         fonts-noto-color-emoji \
+        tzdata \
     && fc-cache -f \
+    && ln -snf "/usr/share/zoneinfo/$TZ" /etc/localtime \
+    && printf '%s\n' "$TZ" > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
