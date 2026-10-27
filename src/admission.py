@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi.responses import JSONResponse
 
+from .diagnostics import RequestDiagnostics, current_diagnostics, log_rejection
 from .limits import LIMITS, ResourceLimitError, check_runtime_resources
 
 
@@ -21,70 +22,117 @@ class RenderAdmissionMiddleware:
         ):
             return await self.app(scope, receive, send)
 
-        async def reject(status: int, message: str, stage: str):
-            response = JSONResponse(
-                status_code=status,
-                content={"code": 1, "message": message, "data": {"stage": stage}},
-                headers={"Retry-After": "5"} if status == 503 else None,
-            )
-            await response(scope, receive, send)
-
-        headers = dict(scope.get("headers", []))
+        diagnostics = RequestDiagnostics(request_bytes=0)
+        token = current_diagnostics.set(diagnostics)
         try:
-            length = int(headers.get(b"content-length", b"0"))
-        except ValueError:
-            return await reject(400, "Invalid Content-Length", "request_body")
-        if length < 0 or length > LIMITS.max_request_bytes:
-            return await reject(413, "Request exceeds T2I_MAX_REQUEST_BYTES", "request_body")
-        if self._pending >= LIMITS.max_queue_size + 1:
-            return await reject(503, "Render queue is full", "queue")
+            async def reject(status: int, message: str, stage: str, *, rejection=None):
+                if rejection is not None:
+                    log_rejection(**{"status": status, "stage": stage, **rejection})
+                response = JSONResponse(
+                    status_code=status,
+                    content={"code": 1, "message": message, "data": {"stage": stage}},
+                    headers={"Retry-After": "5"} if status == 503 else None,
+                )
+                await response(scope, receive, send)
 
-        self._pending += 1
-        acquired = False
-        try:
+            headers = dict(scope.get("headers", []))
             try:
-                await asyncio.wait_for(self._slot.acquire(), LIMITS.queue_timeout)
-                acquired = True
-            except TimeoutError:
-                return await reject(503, "Timed out waiting for the render slot", "queue")
+                raw_length = headers.get(b"content-length")
+                length = int(raw_length) if raw_length is not None else None
+            except ValueError:
+                return await reject(400, "Invalid Content-Length", "request_body")
+            diagnostics.content_length = length
+            if length is not None and (length < 0 or length > LIMITS.max_request_bytes):
+                return await reject(
+                    413, "Request exceeds T2I_MAX_REQUEST_BYTES", "request_body",
+                    rejection={
+                        "category": "request_body", "limit_name": "T2I_MAX_REQUEST_BYTES",
+                        "limit_value": LIMITS.max_request_bytes, "observed": length,
+                    },
+                )
+            if self._pending >= LIMITS.max_queue_size + 1:
+                return await reject(
+                    503, "Render queue is full", "queue",
+                    rejection={
+                        "category": "queue_full", "limit_name": "T2I_MAX_QUEUE_SIZE",
+                        "limit_value": LIMITS.max_queue_size, "observed": self._pending,
+                    },
+                )
 
+            self._pending += 1
+            acquired = False
             try:
-                check_runtime_resources()
-            except ResourceLimitError as error:
-                return await reject(error.status_code, str(error), error.stage)
+                try:
+                    await asyncio.wait_for(self._slot.acquire(), LIMITS.queue_timeout)
+                    acquired = True
+                except TimeoutError:
+                    return await reject(
+                        503, "Timed out waiting for the render slot", "queue",
+                        rejection={
+                            "category": "queue_timeout",
+                            "limit_name": "T2I_QUEUE_TIMEOUT_SECONDS",
+                            "limit_value": LIMITS.queue_timeout,
+                        },
+                    )
 
-            # Buffer only the admitted body, with a byte limit even for chunked uploads.
-            body = bytearray()
-            size = 0
-            try:
-                async with asyncio.timeout(LIMITS.body_timeout):
-                    while True:
-                        message = await receive()
-                        if message["type"] == "http.disconnect":
-                            return
-                        if message["type"] != "http.request":
-                            continue
-                        size += len(message.get("body", b""))
-                        if size > LIMITS.max_request_bytes:
-                            return await reject(413, "Request exceeds T2I_MAX_REQUEST_BYTES", "request_body")
-                        body.extend(message.get("body", b""))
-                        if not message.get("more_body", False):
-                            break
-            except TimeoutError:
-                return await reject(408, "Timed out reading the request body", "request_body")
+                try:
+                    check_runtime_resources()
+                except ResourceLimitError as error:
+                    return await reject(
+                        error.status_code, str(error), error.stage,
+                        rejection={**error.rejection, "stage": "admission"},
+                    )
 
-            body = bytes(body)
-            delivered = False
+                # Buffer only the admitted body, with a byte limit even for chunked uploads.
+                body = bytearray()
+                size = 0
+                try:
+                    async with asyncio.timeout(LIMITS.body_timeout):
+                        while True:
+                            message = await receive()
+                            if message["type"] == "http.disconnect":
+                                return
+                            if message["type"] != "http.request":
+                                continue
+                            size += len(message.get("body", b""))
+                            diagnostics.request_bytes = size
+                            if size > LIMITS.max_request_bytes:
+                                return await reject(
+                                    413, "Request exceeds T2I_MAX_REQUEST_BYTES", "request_body",
+                                    rejection={
+                                        "category": "request_body",
+                                        "limit_name": "T2I_MAX_REQUEST_BYTES",
+                                        "limit_value": LIMITS.max_request_bytes,
+                                        "observed": size,
+                                    },
+                                )
+                            body.extend(message.get("body", b""))
+                            if not message.get("more_body", False):
+                                break
+                except TimeoutError:
+                    return await reject(
+                        408, "Timed out reading the request body", "request_body",
+                        rejection={
+                            "category": "request_body_timeout",
+                            "limit_name": "T2I_BODY_TIMEOUT_SECONDS",
+                            "limit_value": LIMITS.body_timeout,
+                        },
+                    )
 
-            async def replay_receive():
-                nonlocal delivered
-                if not delivered:
-                    delivered = True
-                    return {"type": "http.request", "body": body, "more_body": False}
-                return await receive()
+                body = bytes(body)
+                delivered = False
 
-            return await self.app(scope, replay_receive, send)
+                async def replay_receive():
+                    nonlocal delivered
+                    if not delivered:
+                        delivered = True
+                        return {"type": "http.request", "body": body, "more_body": False}
+                    return await receive()
+
+                return await self.app(scope, replay_receive, send)
+            finally:
+                if acquired:
+                    self._slot.release()
+                self._pending -= 1
         finally:
-            if acquired:
-                self._slot.release()
-            self._pending -= 1
+            current_diagnostics.reset(token)

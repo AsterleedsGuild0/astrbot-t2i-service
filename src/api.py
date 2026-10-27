@@ -16,6 +16,9 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from .admission import RenderAdmissionMiddleware
+from .diagnostics import (
+    RequestDiagnostics, current_diagnostics, log_rejection, record_sizes,
+)
 from .limits import LIMITS, ResourceLimitError, check_html_size, check_runtime_resources
 from .metrics import (
     CLEANUP_DURATION,
@@ -275,18 +278,38 @@ async def render_with_disconnect(http_request, abs_path, options):
 @app.post("/text2img/generate")
 async def text2img(request: GenerateRequest, http_request: fastapi.Request = None):
     temporary_files = []
+    token = None
+    context = current_diagnostics.get()
+    if context is None:
+        context = RequestDiagnostics()
+        token = current_diagnostics.set(context)
+    if request.options is not None:
+        context.options = request.options.model_dump(
+            include={
+                "type", "device_scale_factor_level", "full_page", "viewport_width",
+                "viewport_height", "timeout", "scale", "wait_until", "quality",
+            },
+            exclude_none=True,
+        )
     try:
         if getattr(render, "_unhealthy", False):
-            raise ResourceLimitError("Renderer is unhealthy; restart the container", 503)
+            raise ResourceLimitError(
+                "Renderer is unhealthy; restart the container", 503,
+                category="renderer_unhealthy", limit_name="renderer_healthy",
+                limit_value=True, observed=False, rejection_stage="render",
+            )
         check_runtime_resources()
         return await generate_image(request, http_request, temporary_files)
     except ResourceLimitError as error:
+        log_rejection(**error.rejection)
         return JSONResponse(
             status_code=error.status_code,
             content={"code": 1, "message": str(error), "data": {"stage": error.stage}},
             headers={"Retry-After": "5"} if error.status_code == 503 else None,
         )
     finally:
+        if token is not None:
+            current_diagnostics.reset(token)
         for path in temporary_files:
             remove_temporary_file(path)
 
@@ -321,11 +344,17 @@ async def generate_image(request: GenerateRequest, http_request, temporary_files
                 )
             with template_path.open("rb") as template_file:
                 raw_template = template_file.read(LIMITS.max_html_bytes + 1)
+            record_sizes(template_source_bytes=len(raw_template))
             if len(raw_template) > LIMITS.max_html_bytes:
-                raise ResourceLimitError("Template file exceeds T2I_MAX_HTML_BYTES")
+                raise ResourceLimitError(
+                    "Template file exceeds T2I_MAX_HTML_BYTES",
+                    category="template_input", limit_name="T2I_MAX_HTML_BYTES",
+                    limit_value=LIMITS.max_html_bytes, observed=len(raw_template),
+                    rejection_stage="template_input",
+                )
             tmpl = raw_template.decode("utf-8")
             source = "template_name"
-        check_html_size(tmpl)
+        check_html_size(tmpl, template=True)
         RENDER_INPUT_BYTES.labels(source=source).observe(len(tmpl.encode("utf-8")))
         try:
             _, abs_path = await render.from_jinja_template(tmpl, request.tmpldata or {})
@@ -386,10 +415,15 @@ async def generate_image(request: GenerateRequest, http_request, temporary_files
             options_dump = {}
 
         return_mode = "json" if is_json_return else "file"
-        logger.warning(
-            f"render failed: {type(e).__name__}: {e}; "
-            f"abs_path={abs_path}, options={options_dump}, return_mode={return_mode}"
-        )
+        if isinstance(e, ResourceLimitError):
+            log_rejection(**e.rejection)
+        elif isinstance(e, RenderError) and e.rejection is not None:
+            log_rejection(**e.rejection)
+        else:
+            logger.warning(
+                f"render failed: {type(e).__name__}: {e}; "
+                f"abs_path={abs_path}, options={options_dump}, return_mode={return_mode}"
+            )
 
         error_data = {
             "error_type": type(e).__name__,

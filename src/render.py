@@ -83,10 +83,21 @@ if SKIP_FONT_READY:
 
 
 class RenderError(RuntimeError):
-    def __init__(self, stage: str, message: str, status_code: int = 500):
+    def __init__(
+        self, stage: str, message: str, status_code: int = 500, *,
+        category: str | None = None, limit_name: str | None = None,
+        limit_value=None, observed=None,
+    ):
         super().__init__(message)
         self.stage = stage
         self.status_code = status_code
+        self.rejection = (
+            {
+                "status": status_code, "stage": stage, "category": category,
+                "limit_name": limit_name, "limit_value": limit_value, "observed": observed,
+            }
+            if category is not None else None
+        )
 
 
 class FloatRect(TypedDict):
@@ -195,7 +206,11 @@ class Text2ImgRender:
             if self.browser is not None:
                 # A disconnected browser invalidates every cached context.
                 if not await self.terminate():
-                    raise RenderError("cleanup", "Old browser could not be stopped", 503)
+                    raise RenderError(
+                        "cleanup", "Old browser could not be stopped", 503,
+                        category="renderer_cleanup", limit_name="T2I_CLEANUP_TIMEOUT_SECONDS",
+                        limit_value=LIMITS.cleanup_timeout,
+                    )
                 self.playwright = await async_playwright().start()
             self.contexts.clear()
             BROWSER_CONTEXTS.set(0)
@@ -314,7 +329,9 @@ class Text2ImgRender:
             await asyncio.wait_for(page.close(), LIMITS.cleanup_timeout)
         except Exception as error:
             raise RenderError(
-                "cleanup", "Page cleanup failed; recycling browser", 503
+                "cleanup", "Page cleanup failed; recycling browser", 503,
+                category="renderer_cleanup", limit_name="T2I_CLEANUP_TIMEOUT_SECONDS",
+                limit_value=LIMITS.cleanup_timeout,
             ) from error
 
     def _effective_options(self, options: ScreenshotOptions) -> ScreenshotOptions:
@@ -342,12 +359,20 @@ class Text2ImgRender:
         # Keep recovery and browser recycling exclusive, even for non-HTTP callers.
         async with self._render_lock:
             if self._unhealthy:
-                raise RenderError("cleanup", "Renderer is unhealthy; restart the container", 503)
-            check_runtime_resources()
+                raise RenderError(
+                    "cleanup", "Renderer is unhealthy; restart the container", 503,
+                    category="renderer_unhealthy", limit_name="renderer_healthy",
+                    limit_value=True, observed=False,
+                )
+            check_runtime_resources(stage="render")
             if self._completed_renders >= LIMITS.browser_max_renders:
                 BROWSER_RESTARTS.labels(reason="render_budget").inc()
                 if not await self.terminate():
-                    raise RenderError("cleanup", "Browser recycling failed; restart the container", 503)
+                    raise RenderError(
+                        "cleanup", "Browser recycling failed; restart the container", 503,
+                        category="renderer_cleanup", limit_name="T2I_CLEANUP_TIMEOUT_SECONDS",
+                        limit_value=LIMITS.cleanup_timeout,
+                    )
             options = self._effective_options(screenshot_options)
             try:
                 async with asyncio.timeout(LIMITS.render_timeout):
@@ -355,7 +380,11 @@ class Text2ImgRender:
             except TimeoutError as error:
                 BROWSER_RESTARTS.labels(reason="deadline").inc()
                 await self.terminate()
-                raise RenderError("deadline", "Render exceeded T2I_RENDER_TIMEOUT_SECONDS", 504) from error
+                raise RenderError(
+                    "deadline", "Render exceeded T2I_RENDER_TIMEOUT_SECONDS", 504,
+                    category="render_timeout", limit_name="T2I_RENDER_TIMEOUT_SECONDS",
+                    limit_value=LIMITS.render_timeout,
+                ) from error
             except RenderError:
                 BROWSER_RESTARTS.labels(reason="render_error").inc()
                 await self.terminate()
@@ -391,7 +420,11 @@ class Text2ImgRender:
             try:
                 page = await context.new_page()
             except TargetClosedError as error:
-                raise RenderError("browser", "Browser context closed before rendering", 503) from error
+                raise RenderError(
+                    "browser", "Browser context closed before rendering", 503,
+                    category="browser_unavailable", limit_name="browser_connected",
+                    limit_value=True, observed=False,
+                ) from error
             RENDER_ACTIVE_PAGES.inc()
 
             wait_until = self._resolve_wait_until(screenshot_options.wait_until)
@@ -487,7 +520,12 @@ class Text2ImgRender:
             height = viewport_height if viewport_height is not None else 720
             scale_factor = self.SCALE_FACTOR_MAP.get(level, 1.0)
             if min(width, height) <= 0 or max(width, height) > LIMITS.max_viewport_dimension:
-                raise ResourceLimitError("Viewport exceeds T2I_MAX_VIEWPORT_DIMENSION")
+                raise ResourceLimitError(
+                    "Viewport exceeds T2I_MAX_VIEWPORT_DIMENSION",
+                    category="viewport_dimension", limit_name="T2I_MAX_VIEWPORT_DIMENSION",
+                    limit_value=LIMITS.max_viewport_dimension, observed=max(width, height),
+                    rejection_stage="viewport",
+                )
             check_screenshot_size(width, height, scale_factor)
             RENDER_VIEWPORT_PIXELS.labels(scale=level).observe(
                 width * height * scale_factor * scale_factor
@@ -537,7 +575,7 @@ class Text2ImgRender:
                         )
                         screenshot_kwargs["quality"] = MIN_JPEG_QUALITY
 
-                check_runtime_resources()
+                check_runtime_resources(stage="screenshot")
                 dimensions = await page.evaluate(
                     """() => {
                         const root = document.documentElement;
@@ -563,7 +601,12 @@ class Text2ImgRender:
                         clip["x"] + clip["width"] > dimensions["width"]
                         or clip["y"] + clip["height"] > dimensions["height"]
                     ):
-                        raise ResourceLimitError("Screenshot clip exceeds document bounds")
+                        raise ResourceLimitError(
+                            "Screenshot clip exceeds document bounds",
+                            category="screenshot_clip", limit_name="document_bounds",
+                            limit_value={"width": dimensions["width"], "height": dimensions["height"]},
+                            rejection_stage="screenshot",
+                        )
                     capture_width = clip["width"]
                     capture_height = clip["height"]
                 output_scale = 1.0 if screenshot_options.scale == "css" else scale_factor
